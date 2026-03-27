@@ -1,0 +1,53 @@
+{
+  "fileInfos" : [ {
+    "path" : "src\\App.tsx",
+    "modificationInfo" : {
+      "contentHash" : 1830849694,
+      "lastModified" : 1774352371450
+    },
+    "linesOfCode" : 8
+  }, {
+    "path" : "src\\embedded\\ClockIDS.cpp",
+    "modificationInfo" : {
+      "contentHash" : 1424144509,
+      "lastModified" : 1774509589088
+    },
+    "linesOfCode" : 611
+  }, {
+    "path" : "src\\embedded\\EthernetMonitor.cpp",
+    "modificationInfo" : {
+      "contentHash" : -719900817,
+      "lastModified" : 1774352371490
+    },
+    "linesOfCode" : 119
+  }, {
+    "path" : "src\\embedded\\central_processor\\src\\main.rs",
+    "modificationInfo" : {
+      "contentHash" : -627212666,
+      "lastModified" : 1774352371521
+    },
+    "linesOfCode" : 109
+  }, {
+    "path" : "src\\embedded\\draw.py",
+    "modificationInfo" : {
+      "contentHash" : -469079771,
+      "lastModified" : 1774508086949
+    },
+    "linesOfCode" : 86
+  }, {
+    "path" : "src\\main.tsx",
+    "modificationInfo" : {
+      "contentHash" : -12746444,
+      "lastModified" : 1774352371407
+    },
+    "linesOfCode" : 10
+  }, {
+    "path" : "vite.config.ts",
+    "modificationInfo" : {
+      "contentHash" : 890002214,
+      "lastModified" : 1774352371597
+    },
+    "linesOfCode" : 24
+  } ],
+  "appVersion" : "1.3.0"
+}
