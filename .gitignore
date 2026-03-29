@@ -6,3 +6,5 @@ coverage/
 *.log
 .env*
 !.env.example
+
+.bevel/do_not_share

@@ -103,6 +103,55 @@ struct Baseline {
 std::unordered_map<std::string, ECUState> ecu_states;   // 训练用
 std::unordered_map<std::string, Baseline> baselines;    // 训练结果
 
+bool save_baselines_csv(const std::string& out_csv) {
+    std::ofstream fout(out_csv);
+    if (!fout.is_open()) return false;
+
+    fout << "id,cycle,mean_skew,stddev_skew,valid\n";
+    fout << std::setprecision(12);
+    for (const auto& pair : baselines) {
+        const auto& id = pair.first;
+        const auto& bl = pair.second;
+        fout << id << ","
+             << bl.cycle << ","
+             << bl.mean_skew << ","
+             << bl.stddev_skew << ","
+             << (bl.valid ? 1 : 0) << "\n";
+    }
+    return true;
+}
+
+bool load_baselines_csv(const std::string& in_csv) {
+    baselines.clear();
+    std::ifstream fin(in_csv);
+    if (!fin.is_open()) return false;
+
+    std::string line;
+    // skip header
+    if (!std::getline(fin, line)) return false;
+
+    while (std::getline(fin, line)) {
+        if (line.empty()) continue;
+        std::stringstream ss(line);
+        std::string id;
+        std::string tok;
+        Baseline bl;
+
+        if (!std::getline(ss, id, ',')) continue;
+        if (!std::getline(ss, tok, ',')) continue;
+        bl.cycle = std::stod(tok);
+        if (!std::getline(ss, tok, ',')) continue;
+        bl.mean_skew = std::stod(tok);
+        if (!std::getline(ss, tok, ',')) continue;
+        bl.stddev_skew = std::stod(tok);
+        if (!std::getline(ss, tok, ',')) continue;
+        bl.valid = (std::stoi(tok) != 0);
+
+        baselines[id] = bl;
+    }
+    return true;
+}
+
 // ---------- 辅助函数 ----------
 std::string escape_json(const std::string& s) {
     std::ostringstream oss;
@@ -231,6 +280,9 @@ void update_baseline(ECUState& state) {
 
 // ---------- 训练 ----------
 void train_on_file(const std::string& input_file) {
+    ecu_states.clear();
+    baselines.clear();
+
     std::ifstream fin(input_file);
     if (!fin.is_open()) {
         std::cerr << "[Error] Cannot open training file: " << input_file << std::endl;
@@ -587,25 +639,380 @@ void detect_on_file(const std::string& input_file, const std::string& output_pre
               << ", duration: " << (last_ts - first_ts) << " seconds" << std::endl;
 }
 
-// ---------- 主函数 ----------
-int main() {
-    // 文件路径（根据实际情况修改）
-    std::string normal_file = "../../CarHackData/normal_run_data.txt";
-    std::vector<std::string> attack_files = {
-        "../../CarHackData/DoS_dataset.csv",
-        "../../CarHackData/Fuzzy_dataset.csv",
-        "../../CarHackData/gear_dataset.csv",
-        "../../CarHackData/RPM_dataset.csv"
-    };
+// 从数据流检测（输入格式同 parse_line 支持的 Timestamp/CSV 行）
+void detect_on_stream(std::istream& in,
+                      const std::string& output_json_file,
+                      const std::string& skew_prefix = "",
+                      bool ndjson_output = false) {
+    // 检测独立状态
+    std::unordered_map<std::string, DetectState> detect_states;
+    // 用于动态周期的队列和计数器
+    std::unordered_map<std::string, std::deque<double>> ts_queues;
+    std::unordered_map<std::string, int> last_cycle_update_counts;
+    // 用于上下文的环形缓冲区
+    std::unordered_map<std::string, std::deque<std::string>> recent_msgs;
+    // 用于记录偏斜的CSV文件（可选）
+    std::unordered_map<std::string, std::ofstream> skew_files;
 
-    train_on_file(normal_file);
+    const bool write_skew = !skew_prefix.empty();
 
-    for (const auto& attack_file : attack_files) {
-        std::string prefix = attack_file.substr(0, attack_file.find_last_of('.'));
-        detect_on_file(attack_file, prefix);
+    // NDJSON：攻击段结束后立刻输出一条 JSON 对象（每行一个对象），便于后端实时轮询
+    std::ofstream ndjson_fout;
+    std::ostream* ndjson_out = nullptr;
+    if (ndjson_output) {
+        if (output_json_file == "-") {
+            ndjson_out = &std::cout;
+        } else {
+            ndjson_fout.open(output_json_file, std::ios::out | std::ios::trunc);
+            if (!ndjson_fout.is_open()) {
+                std::cerr << "[Error] Cannot open NDJSON output: " << output_json_file << std::endl;
+                return;
+            }
+            ndjson_out = &ndjson_fout;
+        }
     }
 
-    std::cout << "All tasks completed." << std::endl;
-    system("pause");
-    return 0;
+    std::string line;
+    int line_num = 0, total_msgs = 0, parse_errors = 0, attack_alerts = 0;
+    std::vector<std::string> attack_packets;
+    double first_ts = 0.0, last_ts = 0.0;
+    bool first_ts_set = false;
+
+    auto write_attack_ndjson = [&](const std::string& obj_str) {
+        if (!ndjson_out) return;
+        // 让 NDJSON 每行都是一个完整对象（去掉格式字符串里的实际换行）
+        std::string compact = obj_str;
+        compact.erase(std::remove(compact.begin(), compact.end(), '\n'), compact.end());
+        compact.erase(std::remove(compact.begin(), compact.end(), '\r'), compact.end());
+        *ndjson_out << compact << "\n";
+        ndjson_out->flush();
+    };
+
+    while (std::getline(in, line)) {
+        ++line_num;
+        if (line.empty()) continue;
+        double ts;
+        std::string id, raw;
+        if (!parse_line(line, ts, id, raw)) {
+            ++parse_errors;
+            if (parse_errors <= 10) std::cerr << "  Warning: Failed to parse line " << line_num << std::endl;
+            continue;
+        }
+        total_msgs++;
+        if (!first_ts_set) {
+            first_ts = ts;
+            first_ts_set = true;
+        }
+        last_ts = ts;
+
+        auto bl_it = baselines.find(id);
+        if (bl_it == baselines.end() || !bl_it->second.valid) continue;
+
+        // 获取或创建检测状态
+        auto ds_it = detect_states.find(id);
+        if (ds_it == detect_states.end()) {
+            ds_it = detect_states.emplace(id, DetectState(ts)).first;
+            ds_it->second.current_cycle = bl_it->second.cycle;
+            ts_queues[id] = std::deque<double>();
+            last_cycle_update_counts[id] = 0;
+
+            if (write_skew) {
+                std::string skew_filename = skew_prefix + "_skew_" + id + ".csv";
+                skew_files[id].open(skew_filename);
+                if (skew_files[id].is_open()) {
+                    skew_files[id] << "timestamp,skew,is_attack\n";
+                } else {
+                    std::cerr << "  Warning: Cannot open skew file for ID " << id << std::endl;
+                }
+            }
+        }
+        DetectState& ds = ds_it->second;
+
+        // 更新时间戳队列（用于周期更新）
+        auto& ts_queue = ts_queues[id];
+        ts_queue.push_back(ts);
+        if (ts_queue.size() > static_cast<size_t>(CYCLE_SAMPLE_SIZE)) ts_queue.pop_front();
+
+        // 定期更新周期
+        ds.count++;
+        if (ds.count - last_cycle_update_counts[id] >= CYCLE_UPDATE_INTERVAL) {
+            double variation = 0.0;
+            double new_cycle = compute_cycle(ts_queue, variation);
+            if (new_cycle > 0 && variation <= CYCLE_VARIATION_THRESHOLD) {
+                ds.current_cycle = new_cycle;
+            }
+            last_cycle_update_counts[id] = ds.count;
+        }
+
+        // 预测当前时间（使用动态周期）
+        double predicted = ds.t0 + (ds.count - 1) * ds.current_cycle;
+        double O = ts - predicted;
+        ds.O_acc += std::abs(O);
+        double t = ts - ds.t0;
+        double e = ds.O_acc - ds.S * t;
+        rls_update(ds, t, e);
+
+        ds.skew_window.push_back(ds.S);
+        if (ds.skew_window.size() > static_cast<size_t>(WINDOW_SIZE)) ds.skew_window.pop_front();
+
+        bool attack = std::abs(ds.S - bl_it->second.mean_skew) > LAMBDA_ER * bl_it->second.stddev_skew;
+
+        // 写入偏斜记录
+        if (write_skew) {
+            auto& skew_file = skew_files[id];
+            if (skew_file.is_open()) {
+                skew_file << std::fixed << std::setprecision(6)
+                          << ts << "," << ds.S << "," << (attack ? 1 : 0) << "\n";
+            }
+        }
+
+        // 保存最近消息用于上下文
+        auto& msg_queue = recent_msgs[id];
+        msg_queue.push_back(raw);
+        if (msg_queue.size() > static_cast<size_t>(CONTEXT_BEFORE + CONTEXT_AFTER + 1)) msg_queue.pop_front();
+
+        if (attack) {
+            if (ds.consecutive_attacks == 0) {
+                // 攻击开始
+                ds.attack_start_time = ts;
+                ds.attack_start_raw = raw;
+                ds.attack_skew_sum = ds.S;
+                ds.attack_skew_sq_sum = ds.S * ds.S;
+                ds.attack_frame_count = 1;
+                ds.attack_context.clear();
+                ds.attack_context.push_back(raw);
+
+                // 保存攻击前上下文
+                ds.pre_context.clear();
+                int before = std::min(static_cast<int>(msg_queue.size()), CONTEXT_BEFORE);
+                if (before > 0) {
+                    auto it_before = msg_queue.end();
+                    std::advance(it_before, -before);
+                    for (int i = 0; i < before; ++i) {
+                        ds.pre_context.push_back(*it_before);
+                        ++it_before;
+                    }
+                }
+            } else {
+                ds.attack_skew_sum += ds.S;
+                ds.attack_skew_sq_sum += ds.S * ds.S;
+                ds.attack_frame_count++;
+                ds.attack_context.push_back(raw);
+            }
+            ds.consecutive_attacks++;
+        } else {
+            if (ds.consecutive_attacks >= MIN_CONSECUTIVE_ATTACKS) {
+                double attack_mean = ds.attack_skew_sum / ds.attack_frame_count;
+                double attack_var = (ds.attack_skew_sq_sum / ds.attack_frame_count) - attack_mean * attack_mean;
+                double attack_std = std::sqrt(std::max(0.0, attack_var));
+                double duration = ts - ds.attack_start_time;
+
+                // 收集攻击后上下文
+                std::vector<std::string> post_context;
+                int after = 0;
+                auto it_post = msg_queue.rbegin();
+                while (after < CONTEXT_AFTER && it_post != msg_queue.rend()) {
+                    post_context.push_back(*it_post);
+                    ++after;
+                    ++it_post;
+                }
+                std::reverse(post_context.begin(), post_context.end());
+
+                std::ostringstream alert;
+                alert << std::fixed << std::setprecision(6);
+                alert << "{\n  \"attack_id\": \"" << id << "\",\n"
+                      << "  \"start_time\": " << ds.attack_start_time << ",\n"
+                      << "  \"end_time\": " << ts << ",\n"
+                      << "  \"duration\": " << duration << ",\n"
+                      << "  \"frame_count\": " << ds.attack_frame_count << ",\n"
+                      << "  \"mean_skew\": " << attack_mean << ",\n"
+                      << "  \"stddev_skew\": " << attack_std << ",\n"
+                      << "  \"pre_context\": [\n";
+                for (size_t i = 0; i < ds.pre_context.size(); ++i) {
+                    alert << "    \"" << escape_json(ds.pre_context[i]) << "\""
+                          << (i + 1 < ds.pre_context.size() ? "," : "") << "\n";
+                }
+                alert << "  ],\n  \"attack_frames\": [\n";
+                for (size_t i = 0; i < ds.attack_context.size(); ++i) {
+                    alert << "    \"" << escape_json(ds.attack_context[i]) << "\""
+                          << (i + 1 < ds.attack_context.size() ? "," : "") << "\n";
+                }
+                alert << "  ],\n  \"post_context\": [\n";
+                for (size_t i = 0; i < post_context.size(); ++i) {
+                    alert << "    \"" << escape_json(post_context[i]) << "\""
+                          << (i + 1 < post_context.size() ? "," : "") << "\n";
+                }
+                alert << "  ]\n}\n";
+                if (ndjson_output) {
+                    write_attack_ndjson(alert.str());
+                } else {
+                    attack_packets.push_back(alert.str());
+                }
+                attack_alerts++;
+            }
+
+            // 重置攻击状态
+            ds.consecutive_attacks = 0;
+            ds.attack_frame_count = 0;
+            ds.attack_context.clear();
+            ds.pre_context.clear();
+        }
+    }
+
+    // 关闭所有偏斜文件
+    for (auto& pair : skew_files) {
+        pair.second.close();
+    }
+
+    // 处理流末尾未结束的攻击段
+    for (auto& pair : detect_states) {
+        const std::string& id = pair.first;
+        DetectState& ds = pair.second;
+        if (ds.consecutive_attacks >= MIN_CONSECUTIVE_ATTACKS) {
+            double attack_mean = ds.attack_skew_sum / ds.attack_frame_count;
+            double attack_var = (ds.attack_skew_sq_sum / ds.attack_frame_count) - attack_mean * attack_mean;
+            double attack_std = std::sqrt(std::max(0.0, attack_var));
+            double duration = last_ts - ds.attack_start_time;
+
+            // 收集攻击后上下文（文件末尾，取最后几帧）
+            std::vector<std::string> post_context;
+            auto& msg_queue = recent_msgs[id];
+            int after = 0;
+            auto it_post = msg_queue.rbegin();
+            while (after < CONTEXT_AFTER && it_post != msg_queue.rend()) {
+                post_context.push_back(*it_post);
+                ++after;
+                ++it_post;
+            }
+            std::reverse(post_context.begin(), post_context.end());
+
+            std::ostringstream alert;
+            alert << std::fixed << std::setprecision(6);
+            alert << "{\n  \"attack_id\": \"" << id << "\",\n"
+                  << "  \"start_time\": " << ds.attack_start_time << ",\n"
+                  << "  \"end_time\": " << last_ts << ",\n"
+                  << "  \"duration\": " << duration << ",\n"
+                  << "  \"frame_count\": " << ds.attack_frame_count << ",\n"
+                  << "  \"mean_skew\": " << attack_mean << ",\n"
+                  << "  \"stddev_skew\": " << attack_std << ",\n"
+                  << "  \"pre_context\": [\n";
+            for (size_t i = 0; i < ds.pre_context.size(); ++i) {
+                alert << "    \"" << escape_json(ds.pre_context[i]) << "\""
+                      << (i + 1 < ds.pre_context.size() ? "," : "") << "\n";
+            }
+            alert << "  ],\n  \"attack_frames\": [\n";
+            for (size_t i = 0; i < ds.attack_context.size(); ++i) {
+                alert << "    \"" << escape_json(ds.attack_context[i]) << "\""
+                      << (i + 1 < ds.attack_context.size() ? "," : "") << "\n";
+            }
+            alert << "  ],\n  \"post_context\": [\n";
+            for (size_t i = 0; i < post_context.size(); ++i) {
+                alert << "    \"" << escape_json(post_context[i]) << "\""
+                      << (i + 1 < post_context.size() ? "," : "") << "\n";
+            }
+            alert << "  ]\n}\n";
+            attack_packets.push_back(alert.str());
+            attack_alerts++;
+        }
+    }
+
+    if (!ndjson_output) {
+        // 写入输出 JSON 数组（兼容旧调用）
+        std::ofstream fout(output_json_file);
+        if (!fout.is_open()) {
+            std::cerr << "[Error] Cannot create output file: " << output_json_file << std::endl;
+            return;
+        }
+        fout << "[\n";
+        for (size_t i = 0; i < attack_packets.size(); ++i) {
+            fout << attack_packets[i] << (i + 1 < attack_packets.size() ? ",\n" : "\n");
+        }
+        fout << "]\n";
+        fout.close();
+    } else {
+        if (ndjson_fout.is_open()) ndjson_fout.close();
+    }
+
+    std::ostream& log_stream = ndjson_output ? std::cerr : std::cout;
+    log_stream << "Detection completed. Total messages: " << total_msgs
+               << ", Parse errors: " << parse_errors
+               << ", Attack alerts: " << attack_alerts
+               << "\n  Attack packets saved to: " << output_json_file
+               << (write_skew ? ("\n  Skew CSV files saved with prefix: " + skew_prefix + "_skew_*.csv") : "")
+               << ", duration: " << (last_ts - first_ts) << " seconds" << std::endl;
+}
+
+// ---------- 主函数 ----------
+int main(int argc, char** argv) {
+    if (argc < 2) {
+        std::cerr
+            << "Usage:\n"
+            << "  ClockIDS train  --normal <normal_run_data.txt> --out-baselines <baselines.csv>\n"
+            << "  ClockIDS detect --baseline <baselines.csv> --out <attack_packets.json> [--skew-prefix <prefix>] [--ndjson]\n"
+            << "    (detect reads data stream from stdin)\n";
+        return 1;
+    }
+
+    std::string mode = argv[1];
+
+    if (mode == "train") {
+        std::string normal_file;
+        std::string out_baselines = "baselines.csv";
+        for (int i = 2; i < argc; ++i) {
+            std::string a = argv[i];
+            if (a == "--normal" && i + 1 < argc) {
+                normal_file = argv[++i];
+            } else if (a == "--out-baselines" && i + 1 < argc) {
+                out_baselines = argv[++i];
+            }
+        }
+
+        if (normal_file.empty()) {
+            std::cerr << "[Error] Missing --normal\n";
+            return 1;
+        }
+
+        train_on_file(normal_file);
+        if (!save_baselines_csv(out_baselines)) {
+            std::cerr << "[Error] Cannot save baselines to: " << out_baselines << std::endl;
+            return 1;
+        }
+        std::cout << "Baselines saved to: " << out_baselines << std::endl;
+        return 0;
+    }
+
+    if (mode == "detect") {
+        std::string baseline_file;
+        std::string out_json = "attack_packets.json";
+        std::string skew_prefix;
+        bool ndjson = false;
+
+        for (int i = 2; i < argc; ++i) {
+            std::string a = argv[i];
+            if (a == "--baseline" && i + 1 < argc) {
+                baseline_file = argv[++i];
+            } else if (a == "--out" && i + 1 < argc) {
+                out_json = argv[++i];
+            } else if (a == "--skew-prefix" && i + 1 < argc) {
+                skew_prefix = argv[++i];
+            } else if (a == "--ndjson") {
+                ndjson = true;
+            }
+        }
+
+        if (baseline_file.empty()) {
+            std::cerr << "[Error] Missing --baseline\n";
+            return 1;
+        }
+        if (!load_baselines_csv(baseline_file)) {
+            std::cerr << "[Error] Cannot load baselines from: " << baseline_file << std::endl;
+            return 1;
+        }
+
+        detect_on_stream(std::cin, out_json, skew_prefix, ndjson);
+        return 0;
+    }
+
+    std::cerr << "[Error] Unknown mode: " << mode << std::endl;
+    return 1;
 }

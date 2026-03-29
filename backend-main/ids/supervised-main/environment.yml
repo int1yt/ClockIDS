@@ -1,0 +1,17 @@
+name: nu
+channels:
+  - pytorch
+  - conda-forge
+  - anaconda
+  - defaults
+dependencies:
+  - python=3.7
+  - jupyter 
+  - pandas 
+  - numpy 
+  - matplotlib 
+  - scikit-learn 
+  - tqdm 
+  - pytorch 
+  - torchvision 
+  - torchaudio

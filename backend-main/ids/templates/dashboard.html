@@ -1,0 +1,293 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <title>ClockIDS 实时预警面板</title>
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+            margin: 0;
+            padding: 0;
+            background: #0f172a;
+            color: #e5e7eb;
+        }
+        header {
+            padding: 16px 24px;
+            background: #020617;
+            border-bottom: 1px solid #1f2937;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+        }
+        h1 {
+            font-size: 20px;
+            margin: 0;
+        }
+        main {
+            padding: 16px 24px 32px;
+        }
+        .controls {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 12px;
+            align-items: center;
+            margin-bottom: 16px;
+        }
+        .controls label {
+            font-size: 13px;
+            color: #9ca3af;
+        }
+        .controls input,
+        .controls select {
+            background: #020617;
+            border: 1px solid #374151;
+            border-radius: 6px;
+            padding: 4px 8px;
+            color: #e5e7eb;
+            font-size: 13px;
+        }
+        button {
+            border-radius: 6px;
+            border: none;
+            padding: 6px 14px;
+            font-size: 13px;
+            cursor: pointer;
+            background: #22c55e;
+            color: #022c22;
+            font-weight: 600;
+        }
+        button[disabled] {
+            opacity: .5;
+            cursor: not-allowed;
+        }
+        .status {
+            font-size: 13px;
+            color: #9ca3af;
+            margin-bottom: 8px;
+        }
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            margin-top: 8px;
+            font-size: 13px;
+        }
+        thead {
+            background: #020617;
+        }
+        th, td {
+            padding: 6px 8px;
+            border-bottom: 1px solid #1f2937;
+        }
+        th {
+            text-align: left;
+            color: #9ca3af;
+            font-weight: 500;
+        }
+        tbody tr:nth-child(2n) {
+            background: #020617;
+        }
+        .pill {
+            display: inline-flex;
+            align-items: center;
+            padding: 2px 8px;
+            border-radius: 999px;
+            font-size: 11px;
+            font-weight: 600;
+        }
+        .pill-DoS { background:#991b1b; color:#fee2e2; }
+        .pill-Fuzzy { background:#92400e; color:#ffedd5; }
+        .pill-gear { background:#1d4ed8; color:#dbeafe; }
+        .pill-RPM { background:#6b21a8; color:#fae8ff; }
+        .pill-unknown { background:#374151; color:#e5e7eb; }
+        .mono {
+            font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+            font-size: 12px;
+        }
+    </style>
+</head>
+<body>
+<header>
+    <h1>ClockIDS 实时攻击检测</h1>
+    <div style="font-size:12px;color:#9ca3af;">后端：Django + ClockIDS.cpp + ML 分类器</div>
+</header>
+<main>
+    <div class="controls">
+        <div>
+            <label>模式</label>
+            <select id="mode">
+                <option value="mixed">Mixed（多种攻击混合）</option>
+                <option value="single">Single（单一类型）</option>
+            </select>
+        </div>
+        <div>
+            <label>攻击类型（single 模式）</label>
+            <select id="attack_kind">
+                <option value="DoS">DoS</option>
+                <option value="Fuzzy">Fuzzy</option>
+                <option value="gear">gear</option>
+                <option value="RPM">RPM</option>
+            </select>
+        </div>
+        <div>
+            <label>攻击段数量</label>
+            <input id="num_attacks" type="number" value="4" min="1" max="20">
+        </div>
+        <div>
+            <label>轮询间隔(ms)</label>
+            <input id="poll_interval" type="number" value="500" min="100" max="5000">
+        </div>
+        <button id="btnStart">开始监测</button>
+        <button id="btnStop" disabled>停止</button>
+    </div>
+    <div class="status" id="status">状态：未开始</div>
+    <table>
+        <thead>
+        <tr>
+            <th>#</th>
+            <th>攻击类型</th>
+            <th>置信度</th>
+            <th>帧数</th>
+            <th>持续时间(s)</th>
+            <th>mean_skew</th>
+            <th>stddev_skew</th>
+        </tr>
+        </thead>
+        <tbody id="tbody">
+        </tbody>
+    </table>
+</main>
+
+<script>
+    const btnStart = document.getElementById('btnStart');
+    const btnStop = document.getElementById('btnStop');
+    const statusEl = document.getElementById('status');
+    const tbody = document.getElementById('tbody');
+    const modeEl = document.getElementById('mode');
+    const attackKindEl = document.getElementById('attack_kind');
+    const numAttacksEl = document.getElementById('num_attacks');
+    const pollIntervalEl = document.getElementById('poll_interval');
+
+    let sessionId = null;
+    let since = 0;
+    let pollTimer = null;
+    let counter = 0;
+
+    function setStatus(text) {
+        statusEl.textContent = '状态：' + text;
+    }
+
+    function pillClass(kind) {
+        if (!kind) return 'pill pill-unknown';
+        if (kind === 'DoS') return 'pill pill-DoS';
+        if (kind === 'Fuzzy') return 'pill pill-Fuzzy';
+        if (kind === 'gear') return 'pill pill-gear';
+        if (kind === 'RPM') return 'pill pill-RPM';
+        return 'pill pill-unknown';
+    }
+
+    function addRows(alerts) {
+        for (const a of alerts) {
+            counter += 1;
+            const tr = document.createElement('tr');
+            const d = a.detail || {};
+            const feat = a.features || {};
+            tr.innerHTML = `
+                <td class="mono">${counter}</td>
+                <td><span class="${pillClass(a.attack_type)}">${a.attack_type || 'unknown'}</span></td>
+                <td>${(a.confidence || 0).toFixed(3)}</td>
+                <td class="mono">${feat.frame_count ?? d.frame_count ?? '-'}</td>
+                <td class="mono">${(feat.duration ?? d.duration ?? 0).toFixed(3)}</td>
+                <td class="mono">${(feat.mean_skew ?? d.mean_skew ?? 0).toFixed(6)}</td>
+                <td class="mono">${(feat.stddev_skew ?? d.stddev_skew ?? 0).toFixed(6)}</td>
+            `;
+            tbody.prepend(tr);
+        }
+    }
+
+    async function pollOnce() {
+        if (!sessionId) return;
+        const params = new URLSearchParams({ session_id: sessionId, since: String(since) });
+        try {
+            const res = await fetch(`/ids/poll_monitor?${params.toString()}`, { method: 'GET' });
+            if (!res.ok) {
+                setStatus('轮询失败：' + res.status);
+                return;
+            }
+            const j = await res.json();
+            const news = j.new || [];
+            if (news.length > 0) {
+                addRows(news);
+            }
+            since = j.total || since;
+            if (j.done) {
+                setStatus('检测结束，总告警数：' + since);
+                clearInterval(pollTimer);
+                pollTimer = null;
+                btnStart.disabled = false;
+                btnStop.disabled = true;
+            }
+        } catch (e) {
+            setStatus('轮询异常：' + e);
+        }
+    }
+
+    btnStart.onclick = async () => {
+        btnStart.disabled = true;
+        btnStop.disabled = false;
+        tbody.innerHTML = '';
+        counter = 0;
+        since = 0;
+        sessionId = null;
+
+        const payload = {
+            mode: modeEl.value,
+            num_attacks: parseInt(numAttacksEl.value || '4', 10),
+            pre_frames: 500,
+            attack_frames: 400,
+            post_frames: 500,
+            sleep_ms: 5
+        };
+        if (payload.mode === 'single') {
+            payload.attack_kind = attackKindEl.value;
+        }
+
+        setStatus('创建监测会话中...');
+        try {
+            const res = await fetch('/ids/start_monitor', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(payload)
+            });
+            if (!res.ok) {
+                const txt = await res.text();
+                setStatus('start_monitor 失败：' + res.status + ' ' + txt);
+                btnStart.disabled = false;
+                btnStop.disabled = true;
+                return;
+            }
+            const j = await res.json();
+            sessionId = j.session_id;
+            setStatus('监测进行中，session_id=' + sessionId);
+
+            const interval = Math.max(100, parseInt(pollIntervalEl.value || '500', 10));
+            pollTimer = setInterval(pollOnce, interval);
+        } catch (e) {
+            setStatus('start_monitor 异常：' + e);
+            btnStart.disabled = false;
+            btnStop.disabled = true;
+        }
+    };
+
+    btnStop.onclick = () => {
+        if (pollTimer) {
+            clearInterval(pollTimer);
+            pollTimer = null;
+        }
+        setStatus('已停止轮询（当前 session 仍可能在后台运行直至结束）');
+        btnStart.disabled = false;
+        btnStop.disabled = true;
+    };
+</script>
+</body>
+</html>
+
