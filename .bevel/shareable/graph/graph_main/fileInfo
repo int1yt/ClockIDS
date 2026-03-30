@@ -2,17 +2,17 @@
   "fileInfos" : [ {
     "path" : "backend-main\\ids\\attack_generator.py",
     "modificationInfo" : {
-      "contentHash" : -18605961,
-      "lastModified" : 1774794329248
+      "contentHash" : -1306270615,
+      "lastModified" : 1774844728404
     },
-    "linesOfCode" : 126
+    "linesOfCode" : 226
   }, {
     "path" : "backend-main\\ids\\ml_attack_classifier.py",
     "modificationInfo" : {
-      "contentHash" : -1273853917,
-      "lastModified" : 1774794349192
+      "contentHash" : 1580323664,
+      "lastModified" : 1774844206464
     },
-    "linesOfCode" : 277
+    "linesOfCode" : 310
   }, {
     "path" : "backend-main\\ids\\urls.py",
     "modificationInfo" : {
@@ -23,10 +23,10 @@
   }, {
     "path" : "backend-main\\ids\\views.py",
     "modificationInfo" : {
-      "contentHash" : -974755350,
-      "lastModified" : 1774794369763
+      "contentHash" : -283594910,
+      "lastModified" : 1774844210848
     },
-    "linesOfCode" : 231
+    "linesOfCode" : 534
   }, {
     "path" : "backend-main\\mysit\\settings.py",
     "modificationInfo" : {
@@ -44,10 +44,10 @@
   }, {
     "path" : "src\\embedded\\ClockIDS.cpp",
     "modificationInfo" : {
-      "contentHash" : -115909147,
-      "lastModified" : 1774794234620
+      "contentHash" : -1640590560,
+      "lastModified" : 1774844702423
     },
-    "linesOfCode" : 977
+    "linesOfCode" : 1024
   }, {
     "path" : "src\\embedded\\EthernetMonitor.cpp",
     "modificationInfo" : {

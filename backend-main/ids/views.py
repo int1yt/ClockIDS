@@ -45,6 +45,17 @@ def _set_session_done(session_id: str, *, done: bool = True, error: Optional[str
             sess["error"] = error
 
 
+def _set_session_progress(session_id: str, progress: Dict[str, Any]) -> None:
+    """
+    将后端执行阶段/统计信息写入 session，供前端轮询展示。
+    """
+    with _monitor_sessions_lock:
+        sess = _monitor_sessions.get(session_id)
+        if not sess:
+            return
+        sess["progress"] = progress
+
+
 def _get_session_snapshot(session_id: str) -> Optional[Dict[str, Any]]:
     with _monitor_sessions_lock:
         sess = _monitor_sessions.get(session_id)
@@ -221,14 +232,14 @@ def simulate_attack_and_predict(request):
         # ensure_trained 内部已保证 baselines 存在，这里再读一次拿到 cycle/id
         from .attack_generator import (
             load_baselines_csv,
-            pick_first_valid_id,
+            pick_valid_id_by_ecu,
             generate_attack_stream_csv,
             generate_mixed_attack_stream_csv,
             build_stream_text,
         )
 
         baselines = load_baselines_csv(settings.CLOCKIDS_BASELINES_CSV_PATH)
-        target = pick_first_valid_id(baselines)
+        target = pick_valid_id_by_ecu(baselines, body.get("ecu_id"))
         if not target:
             return JsonResponse({"error": "No valid baseline id found."}, status=400)
 
@@ -328,11 +339,16 @@ def start_monitor(request):
         "mode": "mixed" | "single",
         "attack_kind": "DoS",              // mode=single
         "attack_kinds": ["DoS","Fuzzy"],  // mode=mixed
-        "num_attacks": 4,
-        "pre_frames": 240,
-        "attack_frames": 220,
-        "post_frames": 240,
-        "sleep_ms": 1                      // 每发送一行到stdin的延迟，用于模拟实时
+        "num_attacks": 8,
+        "pre_frames": 800,
+        "attack_frames": 600,
+        "post_frames": 800,
+        "sleep_ms": 2,
+        "multi_id": true,                  // 多 CAN ID 交错（按时间戳合并为一条流）
+        "num_ids": 5,                      // multi_id 时选取的 ID 数量
+        "ecu_ids": ["0690","0329"],        // 可选，显式指定多个 ID
+        "ecu_id": "0690",                  // 单 ID 模式或 multi_id=false
+        "batch_ml_size": 12                // 攒够 N 条 C++ 告警后一次性 predict_packets
       }
     """
     try:
@@ -343,26 +359,107 @@ def start_monitor(request):
         mode = body.get("mode", "mixed")
         attack_kind = body.get("attack_kind", None)
         attack_kinds = body.get("attack_kinds", ["DoS", "Fuzzy", "gear", "RPM"])
-        num_attacks = int(body.get("num_attacks", 4))
-        pre_frames = int(body.get("pre_frames", 240))
-        attack_frames = int(body.get("attack_frames", 220))
-        post_frames = int(body.get("post_frames", 240))
-        sleep_ms = float(body.get("sleep_ms", 1.0))
+        num_attacks = int(body.get("num_attacks", 8))
+        pre_frames = int(body.get("pre_frames", 800))
+        attack_frames = int(body.get("attack_frames", 600))
+        post_frames = int(body.get("post_frames", 800))
+        sleep_ms = float(body.get("sleep_ms", 2.0))
+        multi_id = bool(body.get("multi_id", True))
+        num_ids = int(body.get("num_ids", 5))
+        batch_ml_size = max(1, int(body.get("batch_ml_size", 12)))
+        seed = body.get("seed", None)
 
         from .attack_generator import (
             load_baselines_csv,
-            pick_first_valid_id,
+            pick_valid_id_by_ecu,
             generate_attack_stream_csv,
             generate_mixed_attack_stream_csv,
+            pick_multiple_baselines,
+            generate_multi_id_mixed_stream,
         )
 
-        # 先选一个可用 ID / cycle（供生成器使用）
         baselines = load_baselines_csv(settings.CLOCKIDS_BASELINES_CSV_PATH)
-        target = pick_first_valid_id(baselines)
-        if not target:
-            return JsonResponse({"error": "No valid baseline id found."}, status=400)
-        ecu_id = target["id"]
-        cycle = float(target["cycle"])
+
+        ecu_ids_param = body.get("ecu_ids")
+        if isinstance(ecu_ids_param, str) and ecu_ids_param.strip():
+            ecu_ids_param = [x.strip() for x in ecu_ids_param.split(",") if x.strip()]
+        elif isinstance(ecu_ids_param, list):
+            ecu_ids_param = [str(x).strip() for x in ecu_ids_param if str(x).strip()]
+            if not ecu_ids_param:
+                ecu_ids_param = None
+        else:
+            ecu_ids_param = None
+
+        stream_iter = None
+        chosen_attack_kinds = None
+        chosen_per_id = None
+        ecu_id = None
+        cycle = None
+        ecu_ids_list: List[str] = []
+        cycles_map: Dict[str, float] = {}
+
+        if multi_id and num_ids >= 2:
+            rows = pick_multiple_baselines(
+                baselines,
+                ecu_ids=ecu_ids_param,
+                num_ids=num_ids,
+            )
+            if len(rows) < 2:
+                return JsonResponse(
+                    {"error": "multi_id 需要至少 2 条有效 baselines，请检查 clockids_baselines.csv"},
+                    status=400,
+                )
+            stream_iter, chosen_per_id = generate_multi_id_mixed_stream(
+                rows,
+                attack_kinds=attack_kinds,
+                num_attacks=num_attacks,
+                pre_frames=pre_frames,
+                attack_frames=attack_frames,
+                post_frames=post_frames,
+                seed=seed,
+            )
+            ecu_ids_list = [str(r["id"]) for r in rows]
+            cycles_map = {str(r["id"]): float(r["cycle"]) for r in rows}
+            ecu_id = ecu_ids_list[0]
+            cycle = cycles_map.get(ecu_id)
+        else:
+            target = pick_valid_id_by_ecu(baselines, body.get("ecu_id"))
+            if not target:
+                return JsonResponse({"error": "No valid baseline id found."}, status=400)
+            ecu_id = target["id"]
+            cycle = float(target["cycle"])
+            ecu_ids_list = [str(ecu_id)]
+            cycles_map = {str(ecu_id): cycle}
+
+            if mode == "single":
+                kind = attack_kind or "DoS"
+                stream_iter = generate_attack_stream_csv(
+                    ecu_id,
+                    cycle,
+                    kind,
+                    start_ts=0.0,
+                    pre_frames=pre_frames,
+                    attack_frames=attack_frames,
+                    post_frames=post_frames,
+                    seed=seed,
+                )
+                chosen_attack_kinds = [kind]
+            elif mode == "mixed":
+                stream_iter, chosen_seq = generate_mixed_attack_stream_csv(
+                    ecu_id,
+                    cycle,
+                    attack_kinds=attack_kinds,
+                    num_attacks=num_attacks,
+                    start_ts=0.0,
+                    pre_frames=pre_frames,
+                    attack_frames=attack_frames,
+                    post_frames=post_frames,
+                    seed=seed,
+                )
+                chosen_attack_kinds = chosen_seq
+            else:
+                return JsonResponse({"error": "Invalid mode. Use mode='single' or 'mixed'."}, status=400)
+            chosen_per_id = [{"id": str(ecu_id), "chosen_attack_kinds": chosen_attack_kinds}]
 
         session_id = uuid.uuid4().hex
         with _monitor_sessions_lock:
@@ -373,7 +470,21 @@ def start_monitor(request):
                 "created_at": time.time(),
                 "ecu_id": ecu_id,
                 "cycle": cycle,
+                "ecu_ids": ecu_ids_list,
+                "cycles": cycles_map,
                 "mode": mode,
+                "chosen_attack_kinds": chosen_attack_kinds,
+                "chosen_per_id": chosen_per_id,
+                "batch_ml_size": batch_ml_size,
+                "progress": {
+                    "stage": "init",
+                    "message": "等待启动 C++ 检测与分类器...",
+                    "stats": {
+                        "cpp_packets_seen": 0,
+                        "classified_packets": 0,
+                        "buf_len": 0,
+                    },
+                },
             }
 
         def worker():
@@ -386,7 +497,31 @@ def start_monitor(request):
                     baselines_csv_path=settings.CLOCKIDS_BASELINES_CSV_PATH,
                     model_path=settings.CLOCKIDS_ATTACK_CLASSIFIER_MODEL_PATH,
                 )
+                _set_session_progress(
+                    session_id,
+                    {
+                        "stage": "training",
+                        "message": "分类器训练/加载中（可能需要较长时间）...",
+                        "stats": {
+                            "cpp_packets_seen": 0,
+                            "classified_packets": 0,
+                            "buf_len": 0,
+                        },
+                    },
+                )
                 classifier.ensure_trained()
+                _set_session_progress(
+                    session_id,
+                    {
+                        "stage": "detect_start",
+                        "message": "分类器就绪，启动 ClockIDS detect...",
+                        "stats": {
+                            "cpp_packets_seen": 0,
+                            "classified_packets": 0,
+                            "buf_len": 0,
+                        },
+                    },
+                )
 
                 ndjson_stdout = "-"
                 cmd = [
@@ -399,32 +534,6 @@ def start_monitor(request):
                     "--ndjson",
                 ]
 
-                # 生成器产生数据流（逐行写入 stdin）
-                if mode == "single":
-                    kind = attack_kind or "DoS"
-                    stream_iter = generate_attack_stream_csv(
-                        ecu_id,
-                        cycle,
-                        kind,
-                        start_ts=0.0,
-                        pre_frames=pre_frames,
-                        attack_frames=attack_frames,
-                        post_frames=post_frames,
-                    )
-                elif mode == "mixed":
-                    stream_iter, _chosen = generate_mixed_attack_stream_csv(
-                        ecu_id,
-                        cycle,
-                        attack_kinds=attack_kinds,
-                        num_attacks=num_attacks,
-                        start_ts=0.0,
-                        pre_frames=pre_frames,
-                        attack_frames=attack_frames,
-                        post_frames=post_frames,
-                    )
-                else:
-                    raise ValueError("Invalid mode, use mode='single' or 'mixed'.")
-
                 proc = subprocess.Popen(
                     cmd,
                     stdin=subprocess.PIPE,
@@ -434,8 +543,21 @@ def start_monitor(request):
                     bufsize=1,
                 )
 
+                # 避免 C++ 向 stderr 大量输出时管道塞满导致子进程阻塞（Windows 上常见）
+                def _drain_stderr() -> None:
+                    try:
+                        if proc.stderr:
+                            proc.stderr.read()
+                    except Exception:
+                        pass
+
+                threading.Thread(target=_drain_stderr, daemon=True).start()
+
+                stats: Dict[str, int] = {"cpp_packets_seen": 0, "classified_packets": 0}
+
                 def reader():
                     assert proc.stdout is not None
+                    buf: List[Dict[str, Any]] = []
                     for line in proc.stdout:
                         line = line.strip()
                         if not line:
@@ -443,15 +565,90 @@ def start_monitor(request):
                         try:
                             pkt = json.loads(line)
                         except Exception:
-                            # 忽略非 JSON 行（理论上 NDJSON 模式下 stdout 应只包含对象）
                             continue
-                        pred = classifier.predict_packet(pkt)
-                        _append_session_alert(session_id, pred)
+                        buf.append(pkt)
+                        stats["cpp_packets_seen"] += 1
+                        if stats["cpp_packets_seen"] % 50 == 0:
+                            _set_session_progress(
+                                session_id,
+                                {
+                                    "stage": "detecting",
+                                    "message": "已从 C++ 收到数据流，等待分类缓冲..." ,
+                                    "stats": {
+                                        "cpp_packets_seen": stats["cpp_packets_seen"],
+                                        "classified_packets": stats["classified_packets"],
+                                        "buf_len": len(buf),
+                                    },
+                                },
+                            )
+
+                        if len(buf) >= batch_ml_size:
+                            _set_session_progress(
+                                session_id,
+                                {
+                                    "stage": "classifying",
+                                    "message": f"缓冲满（{len(buf)}），正在分类预测...",
+                                    "stats": {
+                                        "cpp_packets_seen": stats["cpp_packets_seen"],
+                                        "classified_packets": stats["classified_packets"],
+                                        "buf_len": len(buf),
+                                    },
+                                },
+                            )
+                            preds = classifier.predict_packets(buf)
+                            buf.clear()
+                            stats["classified_packets"] += len(preds)
+                            for p in preds:
+                                _append_session_alert(session_id, p)
+                            _set_session_progress(
+                                session_id,
+                                {
+                                    "stage": "classifying_done",
+                                    "message": f"已输出 {len(preds)} 条告警，继续等待下一批...",
+                                    "stats": {
+                                        "cpp_packets_seen": stats["cpp_packets_seen"],
+                                        "classified_packets": stats["classified_packets"],
+                                        "buf_len": len(buf),
+                                    },
+                                },
+                            )
+                    if buf:
+                        preds = classifier.predict_packets(buf)
+                        stats["classified_packets"] += len(preds)
+                        buf.clear()
+                        for p in preds:
+                            _append_session_alert(session_id, p)
+
+                        _set_session_progress(
+                            session_id,
+                            {
+                                "stage": "classifying_done",
+                                "message": f"输入结束，补输出 {len(preds)} 条告警...",
+                                "stats": {
+                                    "cpp_packets_seen": stats["cpp_packets_seen"],
+                                    "classified_packets": stats["classified_packets"],
+                                    "buf_len": 0,
+                                },
+                            },
+                        )
 
                 t_reader = threading.Thread(target=reader, daemon=True)
                 t_reader.start()
+                _set_session_progress(
+                    session_id,
+                    {
+                        "stage": "injecting",
+                        "message": "开始向 C++ 注入模拟数据流...",
+                        "stats": {
+                            "cpp_packets_seen": 0,
+                            "classified_packets": 0,
+                            "buf_len": 0,
+                        },
+                    },
+                )
 
                 assert proc.stdin is not None
+                assert stream_iter is not None
                 for one_line in stream_iter:
                     proc.stdin.write(one_line + "\n")
                     proc.stdin.flush()
@@ -459,16 +656,37 @@ def start_monitor(request):
                         time.sleep(sleep_ms / 1000.0)
                 proc.stdin.close()
 
-                t_reader.join(timeout=1200)
-                _set_session_done(session_id, done=True)
-
-                # 读取 stderr，避免子进程残留管道导致异常
-                try:
-                    err_txt = proc.stderr.read().decode("utf-8", errors="ignore") if proc.stderr else ""
-                    # stderr 已经读完但不用返回，留作排查
-                except Exception:
-                    pass
+                t_reader.join(timeout=3600)
+                rc = proc.wait(timeout=60)
+                err_msg = None
+                if rc != 0:
+                    err_msg = f"ClockIDS.exe 退出码 {rc}"
+                _set_session_progress(
+                    session_id,
+                    {
+                        "stage": "done",
+                        "message": "检测结束，准备返回前端展示...",
+                        "stats": {
+                            "cpp_packets_seen": stats["cpp_packets_seen"],
+                            "classified_packets": stats["classified_packets"],
+                            "buf_len": 0,
+                        },
+                    },
+                )
+                _set_session_done(session_id, done=True, error=err_msg)
             except Exception as e:
+                _set_session_progress(
+                    session_id,
+                    {
+                        "stage": "error",
+                        "message": "检测流程异常退出",
+                        "stats": {
+                            "cpp_packets_seen": 0,
+                            "classified_packets": 0,
+                            "buf_len": 0,
+                        },
+                    },
+                )
                 _set_session_done(session_id, done=True, error=str(e))
 
         threading.Thread(target=worker, daemon=True).start()
@@ -514,6 +732,14 @@ def poll_monitor(request):
                 "since": since,
                 "total": len(alerts),
                 "new": new_alerts,
+                "ecu_id": snap.get("ecu_id"),
+                "cycle": snap.get("cycle"),
+                "ecu_ids": snap.get("ecu_ids"),
+                "cycles": snap.get("cycles"),
+                "chosen_attack_kinds": snap.get("chosen_attack_kinds"),
+                "chosen_per_id": snap.get("chosen_per_id"),
+                "batch_ml_size": snap.get("batch_ml_size"),
+                "progress": snap.get("progress"),
             },
             safe=False,
         )

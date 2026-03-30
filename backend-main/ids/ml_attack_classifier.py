@@ -13,7 +13,7 @@ from .attack_generator import (
     build_stream_text,
     generate_attack_stream_csv,
     load_baselines_csv,
-    pick_first_valid_id,
+    pick_valid_id_by_ecu,
 )
 
 
@@ -34,8 +34,9 @@ def _ensure_baselines_exist(
     clockids_bin_path: str,
     normal_data_path: str,
     baselines_csv_path: str,
+    force_retrain_baselines: bool = False,
 ) -> None:
-    if os.path.exists(baselines_csv_path):
+    if (not force_retrain_baselines) and os.path.exists(baselines_csv_path):
         return
 
     os.makedirs(os.path.dirname(baselines_csv_path), exist_ok=True)
@@ -132,6 +133,9 @@ class AttackClassifierService:
     def ensure_trained(
         self,
         *,
+        pre_frames: int = 120,
+        attack_frames: int = 180,
+        post_frames: int = 120,
         samples_per_class: int = 20,
         max_total_samples: int = 200,
         random_seed: int = 42,
@@ -144,10 +148,11 @@ class AttackClassifierService:
             clockids_bin_path=self.clockids_bin_path,
             normal_data_path=self.normal_data_path,
             baselines_csv_path=self.baselines_csv_path,
+            force_retrain_baselines=force_retrain,
         )
 
         baselines = load_baselines_csv(self.baselines_csv_path)
-        target = pick_first_valid_id(baselines)
+        target = pick_valid_id_by_ecu(baselines, None)
         if not target:
             raise RuntimeError("No valid baseline id found. Cannot train classifier.")
 
@@ -180,9 +185,9 @@ class AttackClassifierService:
                         cycle,
                         label,
                         start_ts=0.0,
-                        pre_frames=120,
-                        attack_frames=180,
-                        post_frames=120,
+                        pre_frames=pre_frames,
+                        attack_frames=attack_frames,
+                        post_frames=post_frames,
                         seed=random.randint(0, 10**9),
                     )
                     stream_text = build_stream_text(stream_iter)
@@ -247,14 +252,17 @@ class AttackClassifierService:
         proba = model.predict_proba(X)
         preds = model.predict(X)
 
+        classes = list(getattr(model, "classes_", []))
         results: List[Dict[str, Any]] = []
         for i, pkt in enumerate(packets):
             # 最高概率对应类别（置信度）
             idx = int(proba[i].argmax())
+            prob_by_class = {str(classes[j]): float(proba[i][j]) for j in range(len(classes))}
             results.append(
                 {
                     "attack_type": preds[i],
                     "confidence": float(proba[i][idx]),
+                    "probabilities": prob_by_class,
                     "features": {
                         "mean_skew": float(pkt.get("mean_skew", 0.0)),
                         "stddev_skew": float(pkt.get("stddev_skew", 0.0)),
@@ -277,10 +285,13 @@ class AttackClassifierService:
         proba = model.predict_proba(X)[0]
         pred = model.predict(X)[0]
         idx = int(proba.argmax())
+        classes = list(getattr(model, "classes_", []))
+        prob_by_class = {str(classes[i]): float(proba[i]) for i in range(len(classes))}
 
         return {
             "attack_type": pred,
             "confidence": float(proba[idx]),
+            "probabilities": prob_by_class,
             "features": {
                 "mean_skew": float(packet.get("mean_skew", 0.0)),
                 "stddev_skew": float(packet.get("stddev_skew", 0.0)),

@@ -130,26 +130,60 @@
         </div>
         <div>
             <label>攻击段数量</label>
-            <input id="num_attacks" type="number" value="4" min="1" max="20">
+            <input id="num_attacks" type="number" value="8" min="1" max="20">
         </div>
         <div>
             <label>轮询间隔(ms)</label>
             <input id="poll_interval" type="number" value="500" min="100" max="5000">
         </div>
+        <div>
+            <label title="模拟写入 C++ detect 的帧间隔；设为 0 会尽快把流写入 C++（时间戳仍由生成器决定）">模拟帧间隔(sleep_ms, ms)</label>
+            <input id="sleep_ms" type="number" value="0" min="0" step="1">
+        </div>
+        <div>
+            <label title="勾选后按时间戳合并多路 CAN，C++ 按 ID 独立检测，ML 按批分类">多 ID 交错</label>
+            <input id="multi_id" type="checkbox" checked>
+        </div>
+        <div>
+            <label>多 ID 数量</label>
+            <input id="num_ids" type="number" value="5" min="2" max="16" style="width:56px;">
+        </div>
+        <div>
+            <label title="C++ 告警攒满 N 条后一次性 predict_packets">ML 批大小</label>
+            <input id="batch_ml_size" type="number" value="1" min="1" max="64" style="width:56px;" title="想更快看到第一批结果建议设为 1">
+        </div>
+        <div>
+            <label>前/攻/后帧</label>
+            <input id="pre_frames" type="number" value="800" min="50" style="width:64px;" title="pre">
+            <input id="attack_frames" type="number" value="600" min="50" style="width:64px;" title="attack">
+            <input id="post_frames" type="number" value="800" min="50" style="width:64px;" title="post">
+        </div>
+        <div>
+            <label>单 ID（非多 ID 时）</label>
+            <input id="ecu_id" type="text" placeholder="留空=0690" style="width:120px;" title="不填则后端优先选 0690">
+        </div>
+        <div>
+            <label title="逗号分隔，多 ID 时可选；留空则后端自动选多条基线">多 ID 列表</label>
+            <input id="ecu_ids" type="text" placeholder="0690,0329,00a0" style="width:200px;">
+        </div>
         <button id="btnStart">开始监测</button>
         <button id="btnStop" disabled>停止</button>
     </div>
     <div class="status" id="status">状态：未开始</div>
+    <div class="status mono" id="progress" style="white-space:pre-wrap;"></div>
+    <div class="status mono" id="meta" style="white-space:pre-wrap;"></div>
     <table>
         <thead>
         <tr>
             <th>#</th>
+            <th>CAN ID</th>
             <th>攻击类型</th>
             <th>置信度</th>
             <th>帧数</th>
             <th>持续时间(s)</th>
             <th>mean_skew</th>
             <th>stddev_skew</th>
+            <th>各类概率(简)</th>
         </tr>
         </thead>
         <tbody id="tbody">
@@ -161,11 +195,22 @@
     const btnStart = document.getElementById('btnStart');
     const btnStop = document.getElementById('btnStop');
     const statusEl = document.getElementById('status');
+    const progressEl = document.getElementById('progress');
     const tbody = document.getElementById('tbody');
     const modeEl = document.getElementById('mode');
     const attackKindEl = document.getElementById('attack_kind');
     const numAttacksEl = document.getElementById('num_attacks');
     const pollIntervalEl = document.getElementById('poll_interval');
+    const sleepMsEl = document.getElementById('sleep_ms');
+    const ecuIdEl = document.getElementById('ecu_id');
+    const ecuIdsEl = document.getElementById('ecu_ids');
+    const multiIdEl = document.getElementById('multi_id');
+    const numIdsEl = document.getElementById('num_ids');
+    const batchMlEl = document.getElementById('batch_ml_size');
+    const preFramesEl = document.getElementById('pre_frames');
+    const attackFramesEl = document.getElementById('attack_frames');
+    const postFramesEl = document.getElementById('post_frames');
+    const metaEl = document.getElementById('meta');
 
     let sessionId = null;
     let since = 0;
@@ -191,14 +236,21 @@
             const tr = document.createElement('tr');
             const d = a.detail || {};
             const feat = a.features || {};
+            const probs = a.probabilities || {};
+            const probStr = Object.keys(probs).length
+                ? Object.entries(probs).map(([k,v]) => k + ':' + v.toFixed(2)).join(' ')
+                : '-';
+            const canId = d.attack_id != null ? String(d.attack_id) : '-';
             tr.innerHTML = `
                 <td class="mono">${counter}</td>
+                <td class="mono">${canId}</td>
                 <td><span class="${pillClass(a.attack_type)}">${a.attack_type || 'unknown'}</span></td>
                 <td>${(a.confidence || 0).toFixed(3)}</td>
                 <td class="mono">${feat.frame_count ?? d.frame_count ?? '-'}</td>
                 <td class="mono">${(feat.duration ?? d.duration ?? 0).toFixed(3)}</td>
                 <td class="mono">${(feat.mean_skew ?? d.mean_skew ?? 0).toFixed(6)}</td>
                 <td class="mono">${(feat.stddev_skew ?? d.stddev_skew ?? 0).toFixed(6)}</td>
+                <td class="mono" style="max-width:280px;overflow:hidden;text-overflow:ellipsis;" title="${probStr}">${probStr}</td>
             `;
             tbody.prepend(tr);
         }
@@ -214,11 +266,33 @@
                 return;
             }
             const j = await res.json();
+            if (j.error) {
+                setStatus('后端错误：' + j.error);
+            }
+            if (j.progress) {
+                const pr = j.progress;
+                progressEl.textContent =
+                    (pr.stage ? ('阶段：' + pr.stage + '\n') : '') +
+                    (pr.message ? pr.message : '') +
+                    (pr.stats ? ('\n' + JSON.stringify(pr.stats)) : '');
+            }
             const news = j.new || [];
             if (news.length > 0) {
                 addRows(news);
             }
             since = j.total || since;
+            if (j.ecu_ids && j.ecu_ids.length > 1) {
+                metaEl.textContent =
+                    '多 ID 基线：' + j.ecu_ids.join(',') +
+                    '\n周期(s)：' + (j.cycles ? JSON.stringify(j.cycles) : '-') +
+                    '\nML 批大小：' + (j.batch_ml_size != null ? j.batch_ml_size : '-') +
+                    '\n每 ID 计划攻击段：' + (j.chosen_per_id ? JSON.stringify(j.chosen_per_id) : '-');
+            } else if (j.ecu_id != null) {
+                metaEl.textContent =
+                    '基线对齐：ecu_id=' + j.ecu_id +
+                    '  cycle=' + (j.cycle != null ? Number(j.cycle).toFixed(6) : '-') +
+                    '\n生成器计划攻击段（ground truth）：' + (j.chosen_attack_kinds ? JSON.stringify(j.chosen_attack_kinds) : '-');
+            }
             if (j.done) {
                 setStatus('检测结束，总告警数：' + since);
                 clearInterval(pollTimer);
@@ -238,17 +312,27 @@
         counter = 0;
         since = 0;
         sessionId = null;
+        progressEl.textContent = '';
 
         const payload = {
             mode: modeEl.value,
-            num_attacks: parseInt(numAttacksEl.value || '4', 10),
-            pre_frames: 500,
-            attack_frames: 400,
-            post_frames: 500,
-            sleep_ms: 5
+            num_attacks: parseInt(numAttacksEl.value || '8', 10),
+            pre_frames: parseInt(preFramesEl.value || '800', 10),
+            attack_frames: parseInt(attackFramesEl.value || '600', 10),
+            post_frames: parseInt(postFramesEl.value || '800', 10),
+            sleep_ms: Math.max(0, parseFloat(sleepMsEl.value || '0')),
+            multi_id: multiIdEl.checked,
+            num_ids: Math.max(2, parseInt(numIdsEl.value || '5', 10)),
+            batch_ml_size: Math.max(1, parseInt(batchMlEl.value || '12', 10))
         };
         if (payload.mode === 'single') {
             payload.attack_kind = attackKindEl.value;
+        }
+        const ecu = (ecuIdEl.value || '').trim();
+        if (ecu && !multiIdEl.checked) payload.ecu_id = ecu;
+        const ecuIdsRaw = (ecuIdsEl.value || '').trim();
+        if (multiIdEl.checked && ecuIdsRaw) {
+            payload.ecu_ids = ecuIdsRaw.split(',').map(s => s.trim()).filter(Boolean);
         }
 
         setStatus('创建监测会话中...');

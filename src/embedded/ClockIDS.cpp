@@ -1,6 +1,7 @@
 #include <iostream>
 #include <fstream>
 #include <sstream>
+#include <cstdio>
 #include <string>
 #include <vector>
 #include <deque>
@@ -14,17 +15,22 @@
 
 // ---------- 配置参数 ----------
 const double LAMBDA_ER = 3.0;                    // 3-sigma 阈值
-const double RLS_FORGET_FACTOR = 0.99;
+// RLS 遗忘因子越小，估计越“快跟上”状态变化，从而更快结束告警段
+const double RLS_FORGET_FACTOR = 0.97;
 const double RLS_P_INIT = 100.0;
 const int WINDOW_SIZE = 30;                      // 偏斜滑动窗口大小
 const int MIN_MSGS_FOR_CYCLE = 5;
 const int CYCLE_UPDATE_INTERVAL = 100;
 const int CYCLE_SAMPLE_SIZE = 100;
 const int PROGRESS_INTERVAL = 1000;
-const int MIN_CONSECUTIVE_ATTACKS = 1;            // 连续异常帧数达到此值才触发告警
+// 避免噪声导致“刚进入就触发 attack 且迟迟不结束”
+const int MIN_CONSECUTIVE_ATTACKS = 3;            // 连续异常帧数达到此值才触发告警
 const int CONTEXT_BEFORE = 5;                    // 攻击开始前保留的帧数
 const int CONTEXT_AFTER = 5;                     // 攻击结束后保留的帧数
 const double CYCLE_VARIATION_THRESHOLD = 0.2;    // 间隔变异系数阈值，超过则视为非周期
+// 训练得到的 stddev_skew 过小时，3σ 阈值近乎 0，易出现「长期判定为攻击」而无法产生结束边沿，主循环不输出告警；NDJSON 流末尾也未刷出。对阈值用 stddev 做下界。
+// 训练得到的 stddev 过小时阈值近乎 0，容易长期判为攻击
+const double BASELINE_STDDEV_FLOOR = 5e-4;
 
 // ---------- 数据结构 ----------
 struct ECUState {
@@ -174,6 +180,11 @@ std::string escape_json(const std::string& s) {
         }
     }
     return oss.str();
+}
+
+static inline double attack_threshold_3sigma(const Baseline& bl) {
+    double sd = std::max(bl.stddev_skew, BASELINE_STDDEV_FLOOR);
+    return LAMBDA_ER * sd;
 }
 
 // 解析带标签的行（修正ID提取）
@@ -335,13 +346,16 @@ void train_on_file(const std::string& input_file) {
 
         double predicted = state.t0 + (cur_count - 1) * state.cycle;
         double O = ts - predicted;
-        state.O_acc += std::abs(O);
+        double skew_now = std::abs(O);
+        state.O_acc += skew_now;
 
         double t = ts - state.t0;
         double e = state.O_acc - state.S * t;
         rls_update(state, t, e);
 
-        state.skew_window.push_back(state.S);
+        // 用“即时误差大小”作为基线与攻击判断的统计量
+        //（避免 RLS 估计的 S 在攻击后仍长时间滞后导致告警跨越整段流）
+        state.skew_window.push_back(skew_now);
         if (state.skew_window.size() > static_cast<size_t>(WINDOW_SIZE)) state.skew_window.pop_front();
 
         if (total_msgs % PROGRESS_INTERVAL == 0) {
@@ -455,20 +469,22 @@ void detect_on_file(const std::string& input_file, const std::string& output_pre
         // 预测当前时间（使用动态周期）
         double predicted = ds.t0 + (ds.count - 1) * ds.current_cycle;
         double O = ts - predicted;
-        ds.O_acc += std::abs(O);
+        double skew_now = std::abs(O);
+        ds.O_acc += skew_now;
         double t = ts - ds.t0;
         double e = ds.O_acc - ds.S * t;
         rls_update(ds, t, e);
-        ds.skew_window.push_back(ds.S);
+        // 用“即时误差大小”作为 baseline 统计量
+        ds.skew_window.push_back(skew_now);
         if (ds.skew_window.size() > static_cast<size_t>(WINDOW_SIZE)) ds.skew_window.pop_front();
 
-        bool attack = std::abs(ds.S - bl_it->second.mean_skew) > LAMBDA_ER * bl_it->second.stddev_skew;
+        bool attack = std::abs(skew_now - bl_it->second.mean_skew) > attack_threshold_3sigma(bl_it->second);
 
         // 写入偏斜记录
         auto& skew_file = skew_files[id];
         if (skew_file.is_open()) {
             skew_file << std::fixed << std::setprecision(6)
-                      << ts << "," << ds.S << "," << (attack ? 1 : 0) << "\n";
+                      << ts << "," << skew_now << "," << (attack ? 1 : 0) << "\n";
         }
 
         // 保存最近消息用于上下文
@@ -481,8 +497,8 @@ void detect_on_file(const std::string& input_file, const std::string& output_pre
                 // 攻击开始
                 ds.attack_start_time = ts;
                 ds.attack_start_raw = raw;
-                ds.attack_skew_sum = ds.S;
-                ds.attack_skew_sq_sum = ds.S * ds.S;
+                ds.attack_skew_sum = skew_now;
+                ds.attack_skew_sq_sum = skew_now * skew_now;
                 ds.attack_frame_count = 1;
                 ds.attack_context.clear();
                 ds.attack_context.push_back(raw);
@@ -498,8 +514,8 @@ void detect_on_file(const std::string& input_file, const std::string& output_pre
                     }
                 }
             } else {
-                ds.attack_skew_sum += ds.S;
-                ds.attack_skew_sq_sum += ds.S * ds.S;
+                ds.attack_skew_sum += skew_now;
+                ds.attack_skew_sq_sum += skew_now * skew_now;
                 ds.attack_frame_count++;
                 ds.attack_context.push_back(raw);
             }
@@ -747,22 +763,24 @@ void detect_on_stream(std::istream& in,
         // 预测当前时间（使用动态周期）
         double predicted = ds.t0 + (ds.count - 1) * ds.current_cycle;
         double O = ts - predicted;
-        ds.O_acc += std::abs(O);
+        double skew_now = std::abs(O);
+        ds.O_acc += skew_now;
         double t = ts - ds.t0;
         double e = ds.O_acc - ds.S * t;
         rls_update(ds, t, e);
 
-        ds.skew_window.push_back(ds.S);
+        // 用“即时误差大小”作为 baseline 统计量
+        ds.skew_window.push_back(skew_now);
         if (ds.skew_window.size() > static_cast<size_t>(WINDOW_SIZE)) ds.skew_window.pop_front();
 
-        bool attack = std::abs(ds.S - bl_it->second.mean_skew) > LAMBDA_ER * bl_it->second.stddev_skew;
+        bool attack = std::abs(skew_now - bl_it->second.mean_skew) > attack_threshold_3sigma(bl_it->second);
 
         // 写入偏斜记录
         if (write_skew) {
             auto& skew_file = skew_files[id];
             if (skew_file.is_open()) {
                 skew_file << std::fixed << std::setprecision(6)
-                          << ts << "," << ds.S << "," << (attack ? 1 : 0) << "\n";
+                          << ts << "," << skew_now << "," << (attack ? 1 : 0) << "\n";
             }
         }
 
@@ -776,8 +794,8 @@ void detect_on_stream(std::istream& in,
                 // 攻击开始
                 ds.attack_start_time = ts;
                 ds.attack_start_raw = raw;
-                ds.attack_skew_sum = ds.S;
-                ds.attack_skew_sq_sum = ds.S * ds.S;
+                ds.attack_skew_sum = skew_now;
+                ds.attack_skew_sq_sum = skew_now * skew_now;
                 ds.attack_frame_count = 1;
                 ds.attack_context.clear();
                 ds.attack_context.push_back(raw);
@@ -794,8 +812,8 @@ void detect_on_stream(std::istream& in,
                     }
                 }
             } else {
-                ds.attack_skew_sum += ds.S;
-                ds.attack_skew_sq_sum += ds.S * ds.S;
+                ds.attack_skew_sum += skew_now;
+                ds.attack_skew_sq_sum += skew_now * skew_now;
                 ds.attack_frame_count++;
                 ds.attack_context.push_back(raw);
             }
@@ -911,7 +929,11 @@ void detect_on_stream(std::istream& in,
                       << (i + 1 < post_context.size() ? "," : "") << "\n";
             }
             alert << "  ]\n}\n";
-            attack_packets.push_back(alert.str());
+            if (ndjson_output) {
+                write_attack_ndjson(alert.str());
+            } else {
+                attack_packets.push_back(alert.str());
+            }
             attack_alerts++;
         }
     }
@@ -1007,6 +1029,11 @@ int main(int argc, char** argv) {
         if (!load_baselines_csv(baseline_file)) {
             std::cerr << "[Error] Cannot load baselines from: " << baseline_file << std::endl;
             return 1;
+        }
+
+        // Windows 管道连接时 stdout 可能全缓冲，导致 Python 端长时间读不到 NDJSON 行
+        if (ndjson && out_json == "-") {
+            std::setvbuf(stdout, nullptr, _IOLBF, 8192);
         }
 
         detect_on_stream(std::cin, out_json, skew_prefix, ndjson);
