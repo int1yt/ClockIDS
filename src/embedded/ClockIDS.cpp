@@ -41,8 +41,8 @@ const double BASELINE_STDDEV_FLOOR = 8e-4;
 // 到达上限后强制切段，让 ML/前端拿到更贴近真实链路的分段
 // 经验上：你的生成器常见 attack_frames 在 200~600，且 0.1s 周期 ID 的单段攻击持续约 20~60s。
 // 这里取更激进的上限，优先把“超长合并段”打散，让 ML 更容易分类。
-const int MAX_ATTACK_FRAMES_PER_SEGMENT = 300;
-const double MAX_ATTACK_DURATION_SEC = 25.0;
+const int MAX_ATTACK_FRAMES_PER_SEGMENT = 220;
+const double MAX_ATTACK_DURATION_SEC = 15.0;
 
 // ---------- 数据结构 ----------
 struct ECUState {
@@ -508,9 +508,13 @@ void detect_on_file(const std::string& input_file, const std::string& output_pre
         ts_queue.push_back(ts);
         if (ts_queue.size() > static_cast<size_t>(CYCLE_SAMPLE_SIZE)) ts_queue.pop_front();
 
-        // 定期更新周期
+        // 定期更新周期：短周期 ID 更频繁更新，降低预测漂移导致的段边界延后
         ds.count++;
-        if (ds.count - last_cycle_update_counts[id] >= CYCLE_UPDATE_INTERVAL) {
+        int cycle_update_interval = CYCLE_UPDATE_INTERVAL;
+        if (bl_it->second.cycle > 0.0 && bl_it->second.cycle < 0.020) {
+            cycle_update_interval = 20;
+        }
+        if (ds.count - last_cycle_update_counts[id] >= cycle_update_interval) {
             double variation = 0.0;
             double new_cycle = compute_cycle(ts_queue, variation);
             if (new_cycle > 0 && variation <= CYCLE_VARIATION_THRESHOLD) {
@@ -556,9 +560,14 @@ void detect_on_file(const std::string& input_file, const std::string& output_pre
             parse_can_fields_from_csv_line(line, can_dlc, can_data_hex);
         }
 
+        int required_attacks = MIN_CONSECUTIVE_ATTACKS;
+        if (bl_it->second.cycle > 0.0 && bl_it->second.cycle < 0.020) {
+            required_attacks = 2;
+        }
+
         if (attack) {
             // 若攻击段过长，强制“切一刀”输出子段并立即开启新段
-            if (ds.consecutive_attacks >= MIN_CONSECUTIVE_ATTACKS &&
+            if (ds.consecutive_attacks >= required_attacks &&
                 ds.attack_frame_count > 0 &&
                 (ds.attack_frame_count >= MAX_ATTACK_FRAMES_PER_SEGMENT ||
                  (ds.attack_last_time > 0.0 && (ds.attack_last_time - ds.attack_start_time) >= MAX_ATTACK_DURATION_SEC))) {
@@ -716,7 +725,7 @@ void detect_on_file(const std::string& input_file, const std::string& output_pre
                 ds.consecutive_non_attacks++;
 
                 if (ds.consecutive_non_attacks >= MIN_CONSECUTIVE_NON_ATTACKS) {
-                    if (ds.consecutive_attacks >= MIN_CONSECUTIVE_ATTACKS) {
+                    if (ds.consecutive_attacks >= required_attacks) {
                         double attack_mean = ds.attack_skew_sum / ds.attack_frame_count;
                         double attack_var = (ds.attack_skew_sq_sum / ds.attack_frame_count) - attack_mean * attack_mean;
                         double attack_std = std::sqrt(std::max(0.0, attack_var));
@@ -819,7 +828,12 @@ void detect_on_file(const std::string& input_file, const std::string& output_pre
     for (auto& pair : detect_states) {
         const std::string& id = pair.first;
         DetectState& ds = pair.second;
-        if (ds.consecutive_attacks >= MIN_CONSECUTIVE_ATTACKS) {
+        int required_attacks = MIN_CONSECUTIVE_ATTACKS;
+        auto bl_it = baselines.find(id);
+        if (bl_it != baselines.end() && bl_it->second.valid && bl_it->second.cycle > 0.0 && bl_it->second.cycle < 0.020) {
+            required_attacks = 2;
+        }
+        if (ds.consecutive_attacks >= required_attacks) {
             double attack_mean = ds.attack_skew_sum / ds.attack_frame_count;
             double attack_var = (ds.attack_skew_sq_sum / ds.attack_frame_count) - attack_mean * attack_mean;
             double attack_std = std::sqrt(std::max(0.0, attack_var));
@@ -1018,9 +1032,13 @@ void detect_on_stream(std::istream& in,
         ts_queue.push_back(ts);
         if (ts_queue.size() > static_cast<size_t>(CYCLE_SAMPLE_SIZE)) ts_queue.pop_front();
 
-        // 定期更新周期
+        // 定期更新周期：短周期 ID 更频繁更新，降低预测漂移导致的段边界延后
         ds.count++;
-        if (ds.count - last_cycle_update_counts[id] >= CYCLE_UPDATE_INTERVAL) {
+        int cycle_update_interval = CYCLE_UPDATE_INTERVAL;
+        if (bl_it->second.cycle > 0.0 && bl_it->second.cycle < 0.020) {
+            cycle_update_interval = 20;
+        }
+        if (ds.count - last_cycle_update_counts[id] >= cycle_update_interval) {
             double variation = 0.0;
             double new_cycle = compute_cycle(ts_queue, variation);
             if (new_cycle > 0 && variation <= CYCLE_VARIATION_THRESHOLD) {
@@ -1069,9 +1087,14 @@ void detect_on_stream(std::istream& in,
             parse_can_fields_from_csv_line(line, can_dlc, can_data_hex);
         }
 
+        int required_attacks = MIN_CONSECUTIVE_ATTACKS;
+        if (bl_it->second.cycle > 0.0 && bl_it->second.cycle < 0.020) {
+            required_attacks = 2;
+        }
+
         if (attack) {
             // 若攻击段过长，强制切段（NDJSON 模式也需要）
-            if (ds.consecutive_attacks >= MIN_CONSECUTIVE_ATTACKS &&
+            if (ds.consecutive_attacks >= required_attacks &&
                 ds.attack_frame_count > 0 &&
                 (ds.attack_frame_count >= MAX_ATTACK_FRAMES_PER_SEGMENT ||
                  (ds.attack_last_time > 0.0 && (ds.attack_last_time - ds.attack_start_time) >= MAX_ATTACK_DURATION_SEC))) {
@@ -1168,8 +1191,12 @@ void detect_on_stream(std::istream& in,
                 ds.attack_context.push_back(raw);
                 ds.attack_ts_series.clear();
                 ds.attack_residual_series.clear();
+                ds.attack_dlc_series.clear();
+                ds.attack_data_hex_series.clear();
                 ds.attack_ts_series.push_back(ts);
                 ds.attack_residual_series.push_back(residual_now);
+                ds.attack_dlc_series.push_back(can_dlc);
+                ds.attack_data_hex_series.push_back(can_data_hex);
                 ds.attack_residual_min = residual_now;
                 ds.attack_residual_max = residual_now;
                 ds.consecutive_non_attacks = 0;
@@ -1205,7 +1232,7 @@ void detect_on_stream(std::istream& in,
             ds.consecutive_attacks++;
 
             // NDJSON：达到最小连续攻击帧时立刻输出 pending 片段（用于 injecting 期间实时展示）
-            if (ndjson_output && ds.consecutive_attacks == MIN_CONSECUTIVE_ATTACKS) {
+            if (ndjson_output && ds.consecutive_attacks == required_attacks) {
                 double attack_mean = ds.attack_skew_sum / ds.attack_frame_count;
                 double attack_var = (ds.attack_skew_sq_sum / ds.attack_frame_count) - attack_mean * attack_mean;
                 double attack_std = std::sqrt(std::max(0.0, attack_var));
@@ -1274,7 +1301,7 @@ void detect_on_stream(std::istream& in,
                 ds.consecutive_non_attacks++;
 
                 if (ds.consecutive_non_attacks >= MIN_CONSECUTIVE_NON_ATTACKS) {
-                    if (ds.consecutive_attacks >= MIN_CONSECUTIVE_ATTACKS) {
+                    if (ds.consecutive_attacks >= required_attacks) {
                         double attack_mean = ds.attack_skew_sum / ds.attack_frame_count;
                         double attack_var = (ds.attack_skew_sq_sum / ds.attack_frame_count) - attack_mean * attack_mean;
                         double attack_std = std::sqrt(std::max(0.0, attack_var));

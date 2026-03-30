@@ -20,10 +20,10 @@ from .attack_generator import (
     pick_valid_id_by_ecu,
 )
 
-FEATURE_VERSION = 3
+FEATURE_VERSION = 5
 
-# 低置信度时不要硬输出某个攻击类型，避免“看起来全是 fuzzy/gear”
-MIN_CONFIDENCE_FOR_LABEL = 0.50
+# 低置信度时不要硬输出某个攻击类型（0 表示关闭；需要时再打开）
+MIN_CONFIDENCE_FOR_LABEL = 0.0
 
 
 def extract_features(packet: Dict[str, Any]) -> List[float]:
@@ -109,6 +109,30 @@ def extract_features(packet: Dict[str, Any]) -> List[float]:
             s_ty = float(sum((ts[i] - t_mean) * (residual_series[i] - y_mean) for i in range(len(ts))))
             slope = float(s_ty / s_tt)
 
+    # 时间间隔特征：直接反映 DoS/Fuzzy/gear/RPM 的“间隔模式”
+    dt_mean = 0.0
+    dt_std = 0.0
+    dt_p25 = 0.0
+    dt_p50 = 0.0
+    dt_p75 = 0.0
+    dt_range = 0.0
+    dt_norm_mean = 0.0
+    dt_norm_std = 0.0
+    if len(ts_series) >= 3:
+        dts = [ts_series[i] - ts_series[i - 1] for i in range(1, len(ts_series))]
+        dts = [float(x) for x in dts if x > 0]
+        if dts:
+            dt_mean = float(sum(dts) / len(dts))
+            dt_var = float(sum((x - dt_mean) ** 2 for x in dts) / max(1, len(dts)))
+            dt_std = float(math.sqrt(max(0.0, dt_var)))
+            dt_p25 = _quantile(dts, 0.25)
+            dt_p50 = _quantile(dts, 0.50)
+            dt_p75 = _quantile(dts, 0.75)
+            dt_range = float(max(dts) - min(dts))
+            if cycle > 0:
+                dt_norm_mean = float(dt_mean / max(eps, cycle))
+                dt_norm_std = float(dt_std / max(eps, cycle))
+
     return [
         mean_skew,
         stddev_skew,
@@ -137,6 +161,14 @@ def extract_features(packet: Dict[str, Any]) -> List[float]:
         res_std,
         res_abs_mean,
         slope,
+        dt_mean,
+        dt_std,
+        dt_p25,
+        dt_p50,
+        dt_p75,
+        dt_range,
+        dt_norm_mean,
+        dt_norm_std,
     ]
 
 
@@ -279,8 +311,8 @@ class AttackClassifierService:
         pre_frames: int = 120,
         attack_frames: int = 180,
         post_frames: int = 120,
-        samples_per_class: int = 20,
-        max_total_samples: int = 200,
+        samples_per_class: int = 80,
+        max_total_samples: int = 1200,
         random_seed: int = 42,
         force_retrain: bool = False,
     ) -> None:
