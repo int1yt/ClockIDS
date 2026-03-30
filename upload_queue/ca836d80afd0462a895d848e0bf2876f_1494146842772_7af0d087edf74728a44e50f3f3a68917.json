@@ -1,0 +1,226 @@
+{
+  "ts": 1494146842.772446,
+  "source": "can",
+  "session_id": "ca836d80afd0462a895d848e0bf2876f",
+  "meta": {
+    "ethernet_csv": "C:\\Users\\Luyutong\\Desktop\\ClockIDS-ver1\\EthernetData\\data_8000_normal.csv",
+    "start_ts_aligned": 1494146520.0,
+    "mode": "mixed",
+    "multi_id": true,
+    "ecu_ids": [
+      "0690",
+      "00a0",
+      "00a1",
+      "05f0",
+      "0329"
+    ],
+    "cycles": {
+      "0690": 0.0999989606896,
+      "00a0": 0.0999186720167,
+      "00a1": 0.0999186330912,
+      "05f0": 0.0499988575371,
+      "0329": 0.00999200100801
+    },
+    "chosen_per_id": [
+      {
+        "id": "0690",
+        "chosen_attack_kinds": [
+          "RPM",
+          "RPM",
+          "gear",
+          "Fuzzy",
+          "DoS",
+          "Fuzzy",
+          "RPM",
+          "Fuzzy"
+        ]
+      },
+      {
+        "id": "00a0",
+        "chosen_attack_kinds": [
+          "DoS",
+          "Fuzzy",
+          "RPM",
+          "gear",
+          "RPM",
+          "Fuzzy",
+          "DoS",
+          "gear"
+        ]
+      },
+      {
+        "id": "00a1",
+        "chosen_attack_kinds": [
+          "gear",
+          "RPM",
+          "RPM",
+          "DoS",
+          "RPM",
+          "RPM",
+          "DoS",
+          "Fuzzy"
+        ]
+      },
+      {
+        "id": "05f0",
+        "chosen_attack_kinds": [
+          "gear",
+          "Fuzzy",
+          "RPM",
+          "gear",
+          "Fuzzy",
+          "DoS",
+          "gear",
+          "gear"
+        ]
+      },
+      {
+        "id": "0329",
+        "chosen_attack_kinds": [
+          "gear",
+          "Fuzzy",
+          "DoS",
+          "Fuzzy",
+          "DoS",
+          "RPM",
+          "DoS",
+          "Fuzzy"
+        ]
+      }
+    ],
+    "batch_ml_size": 1
+  },
+  "result": {
+    "attack_id": "05f0",
+    "event": "start",
+    "start_time": 1494146842.772446,
+    "end_time": 1494146842.85598,
+    "duration": 0.083534,
+    "frame_count": 3,
+    "mean_skew": 65.154836,
+    "stddev_skew": 0.423349,
+    "cycle": 0.0499988575371,
+    "baseline_mean": 0.938366,
+    "baseline_stddev": 0.010975,
+    "thr_3sigma": 0.0439,
+    "residual_min": 64.560467,
+    "residual_max": 65.514319,
+    "segment_end_reason": "start",
+    "ts_series": [
+      1494146842.772446,
+      1494146842.813394,
+      1494146842.85598
+    ],
+    "residual_series": [
+      65.514319,
+      65.389721,
+      64.560467
+    ],
+    "dlc_series": [
+      2,
+      2,
+      2,
+      2,
+      2,
+      2,
+      2,
+      2,
+      2,
+      2,
+      2,
+      2,
+      2,
+      2,
+      2,
+      2,
+      2,
+      2,
+      2,
+      2,
+      "<...truncated...>",
+      2,
+      2,
+      2,
+      2,
+      2,
+      2,
+      2,
+      2,
+      2,
+      2,
+      2,
+      2,
+      2,
+      2,
+      2,
+      2,
+      2,
+      2,
+      2,
+      2
+    ],
+    "data_hex_series": [
+      "f400",
+      "f400",
+      "f400",
+      "f400",
+      "f400",
+      "f400",
+      "f400",
+      "f400",
+      "f400",
+      "f400",
+      "f400",
+      "f400",
+      "f400",
+      "f400",
+      "f400",
+      "f400",
+      "f400",
+      "f400",
+      "f400",
+      "f400",
+      "<...truncated...>",
+      "0100",
+      "0100",
+      "0100",
+      "0100",
+      "0100",
+      "0100",
+      "0100",
+      "0100",
+      "0100",
+      "0100",
+      "0100",
+      "0100",
+      "0100",
+      "0100",
+      "0100",
+      "0100",
+      "0100",
+      "0100",
+      "0100",
+      "0100"
+    ],
+    "pre_context": [
+      "1494146842.610628,05f0,2,0100",
+      "1494146842.649606,05f0,2,0100",
+      "1494146842.688220,05f0,2,0100",
+      "1494146842.730603,05f0,2,0100",
+      "1494146842.772446,05f0,2,0100"
+    ],
+    "attack_frames": [
+      "1494146842.772446,05f0,2,0100",
+      "1494146842.813394,05f0,2,0100",
+      "1494146842.855980,05f0,2,0100"
+    ],
+    "post_context": [],
+    "pre_context_len": 5,
+    "attack_frames_len": 3,
+    "post_context_len": 0,
+    "ts_series_len": 3,
+    "residual_series_len": 3,
+    "dlc_series_len": 5848,
+    "data_hex_series_len": 5848
+  }
+}

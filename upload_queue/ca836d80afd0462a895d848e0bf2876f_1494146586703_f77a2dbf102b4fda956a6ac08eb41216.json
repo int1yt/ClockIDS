@@ -1,0 +1,226 @@
+{
+  "ts": 1494146586.703039,
+  "source": "can",
+  "session_id": "ca836d80afd0462a895d848e0bf2876f",
+  "meta": {
+    "ethernet_csv": "C:\\Users\\Luyutong\\Desktop\\ClockIDS-ver1\\EthernetData\\data_8000_normal.csv",
+    "start_ts_aligned": 1494146520.0,
+    "mode": "mixed",
+    "multi_id": true,
+    "ecu_ids": [
+      "0690",
+      "00a0",
+      "00a1",
+      "05f0",
+      "0329"
+    ],
+    "cycles": {
+      "0690": 0.0999989606896,
+      "00a0": 0.0999186720167,
+      "00a1": 0.0999186330912,
+      "05f0": 0.0499988575371,
+      "0329": 0.00999200100801
+    },
+    "chosen_per_id": [
+      {
+        "id": "0690",
+        "chosen_attack_kinds": [
+          "RPM",
+          "RPM",
+          "gear",
+          "Fuzzy",
+          "DoS",
+          "Fuzzy",
+          "RPM",
+          "Fuzzy"
+        ]
+      },
+      {
+        "id": "00a0",
+        "chosen_attack_kinds": [
+          "DoS",
+          "Fuzzy",
+          "RPM",
+          "gear",
+          "RPM",
+          "Fuzzy",
+          "DoS",
+          "gear"
+        ]
+      },
+      {
+        "id": "00a1",
+        "chosen_attack_kinds": [
+          "gear",
+          "RPM",
+          "RPM",
+          "DoS",
+          "RPM",
+          "RPM",
+          "DoS",
+          "Fuzzy"
+        ]
+      },
+      {
+        "id": "05f0",
+        "chosen_attack_kinds": [
+          "gear",
+          "Fuzzy",
+          "RPM",
+          "gear",
+          "Fuzzy",
+          "DoS",
+          "gear",
+          "gear"
+        ]
+      },
+      {
+        "id": "0329",
+        "chosen_attack_kinds": [
+          "gear",
+          "Fuzzy",
+          "DoS",
+          "Fuzzy",
+          "DoS",
+          "RPM",
+          "DoS",
+          "Fuzzy"
+        ]
+      }
+    ],
+    "batch_ml_size": 1
+  },
+  "result": {
+    "attack_id": "0329",
+    "event": "start",
+    "start_time": 1494146586.703039,
+    "end_time": 1494146586.72281,
+    "duration": 0.019771,
+    "frame_count": 3,
+    "mean_skew": 77.294645,
+    "stddev_skew": 0.085086,
+    "cycle": 0.00999200100801,
+    "baseline_mean": 8.29447,
+    "baseline_stddev": 4.730987,
+    "thr_3sigma": 18.923949,
+    "residual_min": 77.175235,
+    "residual_max": 77.367209,
+    "segment_end_reason": "start",
+    "ts_series": [
+      1494146586.703039,
+      1494146586.712801,
+      1494146586.72281
+    ],
+    "residual_series": [
+      77.175235,
+      77.341492,
+      77.367209
+    ],
+    "dlc_series": [
+      8,
+      8,
+      8,
+      8,
+      8,
+      8,
+      8,
+      8,
+      8,
+      8,
+      8,
+      8,
+      8,
+      8,
+      8,
+      8,
+      8,
+      8,
+      8,
+      8,
+      "<...truncated...>",
+      8,
+      8,
+      8,
+      8,
+      8,
+      8,
+      8,
+      8,
+      8,
+      8,
+      8,
+      8,
+      8,
+      8,
+      8,
+      8,
+      8,
+      8,
+      8,
+      8
+    ],
+    "data_hex_series": [
+      "0cb47f1411200014",
+      "0cb57f1411200014",
+      "86bd7f1411200014",
+      "40be7f1411200014",
+      "86b87f1411200014",
+      "40bc7f1411200014",
+      "dcbf7f1411200014",
+      "dcb57f1411200014",
+      "86be7f1411200014",
+      "40b97f1411200014",
+      "dcba7f1411200014",
+      "86ba7f1411200014",
+      "dcba7f1411200014",
+      "40b47f1411200014",
+      "40b87f1411200014",
+      "0cb57f1411200014",
+      "40bf7f1411200014",
+      "0cb47f1411200014",
+      "0cb77f1411200014",
+      "86b57f1411200014",
+      "<...truncated...>",
+      "40bd7f1411200014",
+      "dcba7f1411200014",
+      "40b97f1411331b14",
+      "dcb87f1411200014",
+      "dcbe7f1412200014",
+      "40b57f1412200014",
+      "0cb67f1411200014",
+      "87b97f1412200014",
+      "dcb97e1411200014",
+      "0cbf7f1411200014",
+      "dcb07f1411270a14",
+      "40b87f14112e1414",
+      "87b97f1411200014",
+      "dcbd7f1412200014",
+      "87b47f1411613a14",
+      "0cb97f1411200014",
+      "40bc7f1412200014",
+      "dcbd7f1412200014",
+      "0cbb7f1412200014",
+      "0cbf7f1412200014"
+    ],
+    "pre_context": [
+      "1494146586.663141,0329,8,87b47f1411613a14",
+      "1494146586.673088,0329,8,0cb97f1411200014",
+      "1494146586.683056,0329,8,40bc7f1412200014",
+      "1494146586.692985,0329,8,dcbd7f1412200014",
+      "1494146586.703039,0329,8,87be7f1412200014"
+    ],
+    "attack_frames": [
+      "1494146586.703039,0329,8,87be7f1412200014",
+      "1494146586.712801,0329,8,0cbb7f1412200014",
+      "1494146586.722810,0329,8,0cbf7f1412200014"
+    ],
+    "post_context": [],
+    "pre_context_len": 5,
+    "attack_frames_len": 3,
+    "post_context_len": 0,
+    "ts_series_len": 3,
+    "residual_series_len": 3,
+    "dlc_series_len": 2516,
+    "data_hex_series_len": 2516
+  }
+}

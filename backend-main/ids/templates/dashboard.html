@@ -117,6 +117,7 @@
             <select id="mode">
                 <option value="mixed">Mixed（多种攻击混合）</option>
                 <option value="single">Single（单一类型）</option>
+                <option value="ethernet_chain">EthernetChain（以太网攻击链驱动）</option>
             </select>
         </div>
         <div>
@@ -166,11 +167,20 @@
             <label title="逗号分隔，多 ID 时可选；留空则后端自动选多条基线">多 ID 列表</label>
             <input id="ecu_ids" type="text" placeholder="0690,0329,00a0" style="width:200px;">
         </div>
+        <div>
+            <label title="ethernet_chain 模式下使用；留空则后端用默认设置">以太网 CSV</label>
+            <input id="ethernet_csv" type="text" placeholder="EthernetData/data_8000_abnormal.csv" style="width:260px;">
+        </div>
+        <div>
+            <label title="ethernet_chain：攻击段中有多少比例安排在以太网异常之后">异常后比例</label>
+            <input id="after_abnormal_ratio" type="number" value="0.6" min="0" max="1" step="0.05" style="width:72px;">
+        </div>
         <button id="btnStart">开始监测</button>
         <button id="btnStop" disabled>停止</button>
     </div>
     <div class="status" id="status">状态：未开始</div>
     <div class="status mono" id="progress" style="white-space:pre-wrap;"></div>
+    <div class="status mono" id="raw_json" style="white-space:pre-wrap;max-height:320px;overflow:auto;"></div>
     <div class="status mono" id="meta" style="white-space:pre-wrap;"></div>
     <table>
         <thead>
@@ -211,6 +221,9 @@
     const attackFramesEl = document.getElementById('attack_frames');
     const postFramesEl = document.getElementById('post_frames');
     const metaEl = document.getElementById('meta');
+    const rawJsonEl = document.getElementById('raw_json');
+    const ethernetCsvEl = document.getElementById('ethernet_csv');
+    const afterAbnormalRatioEl = document.getElementById('after_abnormal_ratio');
 
     let sessionId = null;
     let since = 0;
@@ -230,10 +243,10 @@
         return 'pill pill-unknown';
     }
 
+    const rowByKey = new Map();
+
     function addRows(alerts) {
         for (const a of alerts) {
-            counter += 1;
-            const tr = document.createElement('tr');
             const d = a.detail || {};
             const feat = a.features || {};
             const probs = a.probabilities || {};
@@ -241,6 +254,28 @@
                 ? Object.entries(probs).map(([k,v]) => k + ':' + v.toFixed(2)).join(' ')
                 : '-';
             const canId = d.attack_id != null ? String(d.attack_id) : '-';
+            const key = a._key || a._update_key || `${canId}:${Number(d.start_time ?? 0).toFixed(6)}`;
+
+            const existing = rowByKey.get(key);
+            if (existing) {
+                const oldCounter = existing.children && existing.children[0] ? existing.children[0].textContent : counter;
+                existing.innerHTML = `
+                    <td class="mono">${oldCounter}</td>
+                    <td class="mono">${canId}</td>
+                    <td><span class="${pillClass(a.attack_type)}">${a.attack_type || 'unknown'}</span></td>
+                    <td>${(a.confidence || 0).toFixed(3)}</td>
+                    <td class="mono">${feat.frame_count ?? d.frame_count ?? '-'}</td>
+                    <td class="mono">${(feat.duration ?? d.duration ?? 0).toFixed(3)}</td>
+                    <td class="mono">${(feat.mean_skew ?? d.mean_skew ?? 0).toFixed(6)}</td>
+                    <td class="mono">${(feat.stddev_skew ?? d.stddev_skew ?? 0).toFixed(6)}</td>
+                    <td class="mono" style="max-width:280px;overflow:hidden;text-overflow:ellipsis;" title="${probStr}">${probStr}</td>
+                `;
+                continue;
+            }
+
+            counter += 1;
+            const tr = document.createElement('tr');
+            tr.dataset.key = key;
             tr.innerHTML = `
                 <td class="mono">${counter}</td>
                 <td class="mono">${canId}</td>
@@ -252,6 +287,7 @@
                 <td class="mono">${(feat.stddev_skew ?? d.stddev_skew ?? 0).toFixed(6)}</td>
                 <td class="mono" style="max-width:280px;overflow:hidden;text-overflow:ellipsis;" title="${probStr}">${probStr}</td>
             `;
+            rowByKey.set(key, tr);
             tbody.prepend(tr);
         }
     }
@@ -268,6 +304,10 @@
             const j = await res.json();
             if (j.error) {
                 setStatus('后端错误：' + j.error);
+                // 错误通常很长，放到进度区便于复制
+                progressEl.textContent =
+                    '后端错误（可复制）：\n' + String(j.error) +
+                    (j.progress ? ('\n\n--- progress ---\n' + JSON.stringify(j.progress, null, 2)) : '');
             }
             if (j.progress) {
                 const pr = j.progress;
@@ -279,6 +319,29 @@
             const news = j.new || [];
             if (news.length > 0) {
                 addRows(news);
+                // pending/更新阶段都显示 ClockIDS 的异常明细（对应 json 文件 result.detail）
+                try {
+                    const last = news[news.length - 1];
+                    const d = last && (last.detail || last.result || last);
+                    if (d) {
+                        let s = JSON.stringify(d, null, 2);
+                        if (s.length > 50000) s = s.slice(0, 50000) + "\n<...truncated...>";
+                        rawJsonEl.textContent = s;
+                    }
+                } catch (e) {
+                    // 忽略显示异常，避免影响轮询
+                }
+                // Debug：明确显示 injecting 阶段是否收到数据
+                try {
+                    const st = (j.progress && j.progress.stage) ? j.progress.stage : '-';
+                    const d0 = news[0] && (news[0].detail || news[0].result || news[0]);
+                    const ev = d0 && d0.event ? d0.event : '';
+                    progressEl.textContent =
+                        (progressEl.textContent ? (progressEl.textContent + '\n') : '') +
+                        `[inject debug] stage=${st} new=${news.length}${ev ? ' event=' + ev : ''}`;
+                } catch (e) {
+                    // ignore
+                }
             }
             since = j.total || since;
             if (j.ecu_ids && j.ecu_ids.length > 1) {
@@ -294,7 +357,9 @@
                     '\n生成器计划攻击段（ground truth）：' + (j.chosen_attack_kinds ? JSON.stringify(j.chosen_attack_kinds) : '-');
             }
             if (j.done) {
-                setStatus('检测结束，总告警数：' + since);
+                if (!j.error) {
+                    setStatus('检测结束，总告警数：' + since);
+                }
                 clearInterval(pollTimer);
                 pollTimer = null;
                 btnStart.disabled = false;
@@ -309,10 +374,12 @@
         btnStart.disabled = true;
         btnStop.disabled = false;
         tbody.innerHTML = '';
+        rowByKey.clear();
         counter = 0;
         since = 0;
         sessionId = null;
         progressEl.textContent = '';
+        rawJsonEl.textContent = '';
 
         const payload = {
             mode: modeEl.value,
@@ -327,6 +394,11 @@
         };
         if (payload.mode === 'single') {
             payload.attack_kind = attackKindEl.value;
+        }
+        if (payload.mode === 'ethernet_chain') {
+            const p = (ethernetCsvEl.value || '').trim();
+            if (p) payload.ethernet_csv = p;
+            payload.after_abnormal_ratio = Math.max(0, Math.min(1, parseFloat(afterAbnormalRatioEl.value || '0.6')));
         }
         const ecu = (ecuIdEl.value || '').trim();
         if (ecu && !multiIdEl.checked) payload.ecu_id = ecu;

@@ -167,3 +167,15 @@ CLOCKIDS_ATTACK_CLASSIFIER_MODEL_PATH = os.environ.get(
     "CLOCKIDS_ATTACK_CLASSIFIER_MODEL_PATH",
     str(BASE_DIR / "ids" / "attack_classifier.joblib")
 )
+
+# ---------- Upload queue (JSON reports) ----------
+UPLOAD_QUEUE_DIR = os.environ.get(
+    "UPLOAD_QUEUE_DIR",
+    str(REPO_ROOT / "upload_queue")
+)
+
+# ---------- Ethernet timestamp alignment ----------
+ETHERNET_DEFAULT_CSV_PATH = os.environ.get(
+    "ETHERNET_DEFAULT_CSV_PATH",
+    str(REPO_ROOT / "EthernetData" / "data_8000_normal.csv")
+)

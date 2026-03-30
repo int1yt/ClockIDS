@@ -28,7 +28,11 @@ def _parse_stream_lines(lines: Sequence[str]) -> List[Tuple[float, str]]:
         line = line.strip()
         if not line:
             continue
-        ts_s, id_s = line.split(",", 1)
+        parts = line.split(",")
+        if len(parts) < 2:
+            continue
+        ts_s = parts[0]
+        id_s = parts[1]
         out.append((float(ts_s), id_s))
     return out
 
@@ -405,8 +409,11 @@ class Command(BaseCommand):
             # 构建每个 id 的时间戳序列（从 merged_lines 过滤出来）
             id_to_ts: Dict[str, List[float]] = {str(r["id"]): [] for r in meta}
             for line in merged_lines:
-                ts, eid = line.split(",", 1)
-                eid = eid.strip()
+                parts = line.split(",")
+                if len(parts) < 2:
+                    continue
+                ts = parts[0]
+                eid = parts[1].strip()
                 if eid not in id_to_ts:
                     continue
                 id_to_ts[eid].append(float(ts))

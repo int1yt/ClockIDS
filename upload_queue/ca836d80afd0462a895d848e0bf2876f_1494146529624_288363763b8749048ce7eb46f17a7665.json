@@ -1,0 +1,148 @@
+{
+  "ts": 1494146529.62413,
+  "source": "can",
+  "session_id": "ca836d80afd0462a895d848e0bf2876f",
+  "meta": {
+    "ethernet_csv": "C:\\Users\\Luyutong\\Desktop\\ClockIDS-ver1\\EthernetData\\data_8000_normal.csv",
+    "start_ts_aligned": 1494146520.0,
+    "mode": "mixed",
+    "multi_id": true,
+    "ecu_ids": [
+      "0690",
+      "00a0",
+      "00a1",
+      "05f0",
+      "0329"
+    ],
+    "cycles": {
+      "0690": 0.0999989606896,
+      "00a0": 0.0999186720167,
+      "00a1": 0.0999186330912,
+      "05f0": 0.0499988575371,
+      "0329": 0.00999200100801
+    },
+    "chosen_per_id": [
+      {
+        "id": "0690",
+        "chosen_attack_kinds": [
+          "RPM",
+          "RPM",
+          "gear",
+          "Fuzzy",
+          "DoS",
+          "Fuzzy",
+          "RPM",
+          "Fuzzy"
+        ]
+      },
+      {
+        "id": "00a0",
+        "chosen_attack_kinds": [
+          "DoS",
+          "Fuzzy",
+          "RPM",
+          "gear",
+          "RPM",
+          "Fuzzy",
+          "DoS",
+          "gear"
+        ]
+      },
+      {
+        "id": "00a1",
+        "chosen_attack_kinds": [
+          "gear",
+          "RPM",
+          "RPM",
+          "DoS",
+          "RPM",
+          "RPM",
+          "DoS",
+          "Fuzzy"
+        ]
+      },
+      {
+        "id": "05f0",
+        "chosen_attack_kinds": [
+          "gear",
+          "Fuzzy",
+          "RPM",
+          "gear",
+          "Fuzzy",
+          "DoS",
+          "gear",
+          "gear"
+        ]
+      },
+      {
+        "id": "0329",
+        "chosen_attack_kinds": [
+          "gear",
+          "Fuzzy",
+          "DoS",
+          "Fuzzy",
+          "DoS",
+          "RPM",
+          "DoS",
+          "Fuzzy"
+        ]
+      }
+    ],
+    "batch_ml_size": 1
+  },
+  "result": {
+    "attack_id": "0329",
+    "event": "start",
+    "start_time": 1494146529.62413,
+    "end_time": 1494146529.641904,
+    "duration": 0.017774,
+    "frame_count": 3,
+    "mean_skew": 27.524302,
+    "stddev_skew": 0.136264,
+    "cycle": 0.00999200100801,
+    "baseline_mean": 8.29447,
+    "baseline_stddev": 4.730987,
+    "thr_3sigma": 18.923949,
+    "residual_min": 27.356999,
+    "residual_max": 27.690772,
+    "segment_end_reason": "start",
+    "ts_series": [
+      1494146529.62413,
+      1494146529.633149,
+      1494146529.641904
+    ],
+    "residual_series": [
+      27.356999,
+      27.525136,
+      27.690772
+    ],
+    "dlc_series": [
+      8,
+      8
+    ],
+    "data_hex_series": [
+      "0cb47f1411200014",
+      "0cb57f1411200014"
+    ],
+    "pre_context": [
+      "1494146529.585936,0329,8,dcb47f1411200014",
+      "1494146529.595742,0329,8,0cba7f1411200014",
+      "1494146529.604899,0329,8,0cbf7f1411200014",
+      "1494146529.614832,0329,8,86bb7f1411200014",
+      "1494146529.624130,0329,8,86bf7f1411200014"
+    ],
+    "attack_frames": [
+      "1494146529.624130,0329,8,86bf7f1411200014",
+      "1494146529.633149,0329,8,0cb47f1411200014",
+      "1494146529.641904,0329,8,0cb57f1411200014"
+    ],
+    "post_context": [],
+    "pre_context_len": 5,
+    "attack_frames_len": 3,
+    "post_context_len": 0,
+    "ts_series_len": 3,
+    "residual_series_len": 3,
+    "dlc_series_len": 2,
+    "data_hex_series_len": 2
+  }
+}

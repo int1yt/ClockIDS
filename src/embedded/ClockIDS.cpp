@@ -37,6 +37,12 @@ const double CYCLE_VARIATION_THRESHOLD = 0.1;    // 间隔变异系数阈值，�
 // 训练得到的 stddev_skew 过小时，3σ 阈值近乎 0，易出现「长期判定为攻击」而无法产生结束边沿，主循环不输出告警；NDJSON 流末尾也未刷出。对阈值用 stddev 做下界。
 // 训练得到的 stddev 过小时阈值近乎 0，容易长期判为攻击
 const double BASELINE_STDDEV_FLOOR = 8e-4;
+// 关键：避免“攻击一直为真”导致告警合并成一个超长段
+// 到达上限后强制切段，让 ML/前端拿到更贴近真实链路的分段
+// 经验上：你的生成器常见 attack_frames 在 200~600，且 0.1s 周期 ID 的单段攻击持续约 20~60s。
+// 这里取更激进的上限，优先把“超长合并段”打散，让 ML 更容易分类。
+const int MAX_ATTACK_FRAMES_PER_SEGMENT = 300;
+const double MAX_ATTACK_DURATION_SEC = 25.0;
 
 // ---------- 数据结构 ----------
 struct ECUState {
@@ -97,13 +103,21 @@ struct DetectState {
     double attack_skew_sq_sum;
     int attack_frame_count;
     std::vector<std::string> attack_context;
+    // 细粒度异常数据：每帧时间戳与残差序列（可用于 ML/回放/更精细特征）
+    std::vector<double> attack_ts_series;
+    std::vector<double> attack_residual_series;
+    std::vector<int> attack_dlc_series;
+    std::vector<std::string> attack_data_hex_series;
+    double attack_residual_min;
+    double attack_residual_max;
     std::vector<std::string> pre_context;
 
     DetectState(double first_ts)
         : t0(first_ts), count(1), O_acc(0.0), S(0.0), P(RLS_P_INIT),
           current_cycle(0.0), consecutive_attacks(0), consecutive_non_attacks(0), attack_start_time(0.0),
           attack_last_time(0.0), attack_end_time_candidate(0.0),
-          attack_skew_sum(0.0), attack_skew_sq_sum(0.0), attack_frame_count(0) {}
+          attack_skew_sum(0.0), attack_skew_sq_sum(0.0), attack_frame_count(0),
+          attack_residual_min(0.0), attack_residual_max(0.0) {}
 };
 
 // 训练结果基线
@@ -228,6 +242,34 @@ bool parse_csv_line(const std::string& line, double& ts, std::string& id, std::s
     if (id.empty()) return false;
     raw_data = line;
     return true;
+}
+
+static inline void parse_can_fields_from_csv_line(
+    const std::string& line,
+    int& dlc_out,
+    std::string& data_hex_out
+) {
+    // 期望格式：ts,id[,dlc,data_hex]
+    // 为兼容旧格式：缺失则返回 dlc=-1, data_hex=""
+    dlc_out = -1;
+    data_hex_out.clear();
+
+    std::stringstream ss(line);
+    std::string tok;
+    // ts
+    if (!std::getline(ss, tok, ',')) return;
+    // id
+    if (!std::getline(ss, tok, ',')) return;
+    // dlc
+    if (!std::getline(ss, tok, ',')) return;
+    try {
+        dlc_out = std::stoi(tok);
+    } catch (...) {
+        dlc_out = -1;
+    }
+    // data_hex
+    if (!std::getline(ss, tok, ',')) return;
+    data_hex_out = tok;
 }
 
 bool parse_line(const std::string& line, double& ts, std::string& id, std::string& raw_data) {
@@ -508,7 +550,109 @@ void detect_on_file(const std::string& input_file, const std::string& output_pre
         msg_queue.push_back(raw);
         if (msg_queue.size() > static_cast<size_t>(CONTEXT_BEFORE + CONTEXT_AFTER + 1)) msg_queue.pop_front();
 
+        int can_dlc = -1;
+        std::string can_data_hex;
+        if (line.find("Timestamp:") == std::string::npos) {
+            parse_can_fields_from_csv_line(line, can_dlc, can_data_hex);
+        }
+
         if (attack) {
+            // 若攻击段过长，强制“切一刀”输出子段并立即开启新段
+            if (ds.consecutive_attacks >= MIN_CONSECUTIVE_ATTACKS &&
+                ds.attack_frame_count > 0 &&
+                (ds.attack_frame_count >= MAX_ATTACK_FRAMES_PER_SEGMENT ||
+                 (ds.attack_last_time > 0.0 && (ds.attack_last_time - ds.attack_start_time) >= MAX_ATTACK_DURATION_SEC))) {
+
+                double attack_mean = ds.attack_skew_sum / ds.attack_frame_count;
+                double attack_var = (ds.attack_skew_sq_sum / ds.attack_frame_count) - attack_mean * attack_mean;
+                double attack_std = std::sqrt(std::max(0.0, attack_var));
+                double end_ts = ds.attack_last_time;
+                double duration = end_ts - ds.attack_start_time;
+
+                // 用最近消息补一点 post_context（此处没有非攻击帧）
+                std::vector<std::string> post_context;
+                int after = 0;
+                auto it_post = msg_queue.rbegin();
+                while (after < CONTEXT_AFTER && it_post != msg_queue.rend()) {
+                    post_context.push_back(*it_post);
+                    ++after;
+                    ++it_post;
+                }
+                std::reverse(post_context.begin(), post_context.end());
+
+                std::ostringstream alert;
+                alert << std::fixed << std::setprecision(6);
+                alert << "{\n  \"attack_id\": \"" << id << "\",\n"
+                      << "  \"start_time\": " << ds.attack_start_time << ",\n"
+                      << "  \"end_time\": " << end_ts << ",\n"
+                      << "  \"duration\": " << duration << ",\n"
+                      << "  \"frame_count\": " << ds.attack_frame_count << ",\n"
+                      << "  \"mean_skew\": " << attack_mean << ",\n"
+                      << "  \"stddev_skew\": " << attack_std << ",\n"
+                      << "  \"cycle\": " << ds.current_cycle << ",\n"
+                      << "  \"baseline_mean\": " << bl_it->second.mean_skew << ",\n"
+                      << "  \"baseline_stddev\": " << std::max(bl_it->second.stddev_skew, BASELINE_STDDEV_FLOOR) << ",\n"
+                      << "  \"thr_3sigma\": " << attack_threshold_3sigma(bl_it->second) << ",\n"
+                      << "  \"residual_min\": " << ds.attack_residual_min << ",\n"
+                      << "  \"residual_max\": " << ds.attack_residual_max << ",\n"
+                      << "  \"segment_end_reason\": \"cap\",\n"
+                      << "  \"ts_series\": [\n";
+                for (size_t i = 0; i < ds.attack_ts_series.size(); ++i) {
+                    alert << "    " << ds.attack_ts_series[i]
+                          << (i + 1 < ds.attack_ts_series.size() ? "," : "") << "\n";
+                }
+                alert << "  ],\n  \"residual_series\": [\n";
+                for (size_t i = 0; i < ds.attack_residual_series.size(); ++i) {
+                    alert << "    " << ds.attack_residual_series[i]
+                          << (i + 1 < ds.attack_residual_series.size() ? "," : "") << "\n";
+                }
+                alert << "  ],\n  \"dlc_series\": [\n";
+                for (size_t i = 0; i < ds.attack_dlc_series.size(); ++i) {
+                    alert << "    " << ds.attack_dlc_series[i]
+                          << (i + 1 < ds.attack_dlc_series.size() ? "," : "") << "\n";
+                }
+                alert << "  ],\n  \"data_hex_series\": [\n";
+                for (size_t i = 0; i < ds.attack_data_hex_series.size(); ++i) {
+                    alert << "    \"" << escape_json(ds.attack_data_hex_series[i]) << "\""
+                          << (i + 1 < ds.attack_data_hex_series.size() ? "," : "") << "\n";
+                }
+                alert << "  ],\n"
+                      << "  \"pre_context\": [\n";
+                for (size_t i = 0; i < ds.pre_context.size(); ++i) {
+                    alert << "    \"" << escape_json(ds.pre_context[i]) << "\""
+                          << (i + 1 < ds.pre_context.size() ? "," : "") << "\n";
+                }
+                alert << "  ],\n  \"attack_frames\": [\n";
+                for (size_t i = 0; i < ds.attack_context.size(); ++i) {
+                    alert << "    \"" << escape_json(ds.attack_context[i]) << "\""
+                          << (i + 1 < ds.attack_context.size() ? "," : "") << "\n";
+                }
+                alert << "  ],\n  \"post_context\": [\n";
+                for (size_t i = 0; i < post_context.size(); ++i) {
+                    alert << "    \"" << escape_json(post_context[i]) << "\""
+                          << (i + 1 < post_context.size() ? "," : "") << "\n";
+                }
+                alert << "  ]\n}\n";
+                attack_packets.push_back(alert.str());
+                attack_alerts++;
+
+                // 重置后立刻开启新段（当前帧将作为新段的第一帧）
+                ds.consecutive_attacks = 0;
+                ds.consecutive_non_attacks = 0;
+                ds.attack_end_time_candidate = 0.0;
+                ds.attack_last_time = 0.0;
+                ds.attack_frame_count = 0;
+                ds.attack_skew_sum = 0.0;
+                ds.attack_skew_sq_sum = 0.0;
+                ds.attack_context.clear();
+                ds.attack_ts_series.clear();
+                ds.attack_residual_series.clear();
+                ds.attack_dlc_series.clear();
+                ds.attack_data_hex_series.clear();
+                ds.attack_residual_min = 0.0;
+                ds.attack_residual_max = 0.0;
+                ds.pre_context.clear();
+            }
             if (ds.consecutive_attacks == 0) {
                 // 攻击开始
                 ds.attack_start_time = ts;
@@ -518,6 +662,16 @@ void detect_on_file(const std::string& input_file, const std::string& output_pre
                 ds.attack_frame_count = 1;
                 ds.attack_context.clear();
                 ds.attack_context.push_back(raw);
+                ds.attack_ts_series.clear();
+                ds.attack_residual_series.clear();
+                ds.attack_dlc_series.clear();
+                ds.attack_data_hex_series.clear();
+                ds.attack_ts_series.push_back(ts);
+                ds.attack_residual_series.push_back(residual_now);
+                ds.attack_dlc_series.push_back(can_dlc);
+                ds.attack_data_hex_series.push_back(can_data_hex);
+                ds.attack_residual_min = residual_now;
+                ds.attack_residual_max = residual_now;
                 ds.consecutive_non_attacks = 0;
                 ds.attack_end_time_candidate = 0.0;
                 // 保存攻击前上下文
@@ -536,12 +690,23 @@ void detect_on_file(const std::string& input_file, const std::string& output_pre
                 ds.attack_skew_sq_sum += residual_now * residual_now;
                 ds.attack_frame_count++;
                 ds.attack_context.push_back(raw);
+                ds.attack_ts_series.push_back(ts);
+                ds.attack_residual_series.push_back(residual_now);
+                if (ds.attack_frame_count == 1) {
+                    ds.attack_residual_min = residual_now;
+                    ds.attack_residual_max = residual_now;
+                } else {
+                    ds.attack_residual_min = std::min(ds.attack_residual_min, residual_now);
+                    ds.attack_residual_max = std::max(ds.attack_residual_max, residual_now);
+                }
             }
             // 攻击重新成立：取消退出确认计数
             ds.attack_last_time = ts;
             ds.consecutive_non_attacks = 0;
             ds.attack_end_time_candidate = 0.0;
             ds.consecutive_attacks++;
+
+            // （detect_on_file：无 NDJSON 输出逻辑）
         } else {
             // 在攻击结束前：至少连续 N 帧非攻击才真正关闭该段
             if (ds.consecutive_attacks > 0) {
@@ -578,6 +743,34 @@ void detect_on_file(const std::string& input_file, const std::string& output_pre
                               << "  \"frame_count\": " << ds.attack_frame_count << ",\n"
                               << "  \"mean_skew\": " << attack_mean << ",\n"
                               << "  \"stddev_skew\": " << attack_std << ",\n"
+                              << "  \"cycle\": " << ds.current_cycle << ",\n"
+                              << "  \"baseline_mean\": " << bl_it->second.mean_skew << ",\n"
+                              << "  \"baseline_stddev\": " << std::max(bl_it->second.stddev_skew, BASELINE_STDDEV_FLOOR) << ",\n"
+                              << "  \"thr_3sigma\": " << attack_threshold_3sigma(bl_it->second) << ",\n"
+                              << "  \"residual_min\": " << ds.attack_residual_min << ",\n"
+                              << "  \"residual_max\": " << ds.attack_residual_max << ",\n"
+                              << "  \"segment_end_reason\": \"recovered\",\n"
+                              << "  \"ts_series\": [\n";
+                        for (size_t i = 0; i < ds.attack_ts_series.size(); ++i) {
+                            alert << "    " << ds.attack_ts_series[i]
+                                  << (i + 1 < ds.attack_ts_series.size() ? "," : "") << "\n";
+                        }
+                        alert << "  ],\n  \"residual_series\": [\n";
+                        for (size_t i = 0; i < ds.attack_residual_series.size(); ++i) {
+                            alert << "    " << ds.attack_residual_series[i]
+                                  << (i + 1 < ds.attack_residual_series.size() ? "," : "") << "\n";
+                        }
+                        alert << "  ],\n  \"dlc_series\": [\n";
+                        for (size_t i = 0; i < ds.attack_dlc_series.size(); ++i) {
+                            alert << "    " << ds.attack_dlc_series[i]
+                                  << (i + 1 < ds.attack_dlc_series.size() ? "," : "") << "\n";
+                        }
+                        alert << "  ],\n  \"data_hex_series\": [\n";
+                        for (size_t i = 0; i < ds.attack_data_hex_series.size(); ++i) {
+                            alert << "    \"" << escape_json(ds.attack_data_hex_series[i]) << "\""
+                                  << (i + 1 < ds.attack_data_hex_series.size() ? "," : "") << "\n";
+                        }
+                        alert << "  ],\n"
                               << "  \"pre_context\": [\n";
                         for (size_t i = 0; i < ds.pre_context.size(); ++i) {
                             alert << "    \"" << escape_json(ds.pre_context[i]) << "\""
@@ -607,6 +800,10 @@ void detect_on_file(const std::string& input_file, const std::string& output_pre
                     ds.attack_skew_sum = 0.0;
                     ds.attack_skew_sq_sum = 0.0;
                     ds.attack_context.clear();
+                    ds.attack_ts_series.clear();
+                    ds.attack_residual_series.clear();
+                    ds.attack_residual_min = 0.0;
+                    ds.attack_residual_max = 0.0;
                     ds.pre_context.clear();
                 }
             } else {
@@ -650,6 +847,34 @@ void detect_on_file(const std::string& input_file, const std::string& output_pre
                   << "  \"frame_count\": " << ds.attack_frame_count << ",\n"
                   << "  \"mean_skew\": " << attack_mean << ",\n"
                   << "  \"stddev_skew\": " << attack_std << ",\n"
+                      << "  \"cycle\": " << ds.current_cycle << ",\n"
+                      << "  \"baseline_mean\": " << baselines[id].mean_skew << ",\n"
+                      << "  \"baseline_stddev\": " << std::max(baselines[id].stddev_skew, BASELINE_STDDEV_FLOOR) << ",\n"
+                      << "  \"thr_3sigma\": " << attack_threshold_3sigma(baselines[id]) << ",\n"
+                      << "  \"residual_min\": " << ds.attack_residual_min << ",\n"
+                      << "  \"residual_max\": " << ds.attack_residual_max << ",\n"
+                      << "  \"segment_end_reason\": \"eof\",\n"
+                      << "  \"ts_series\": [\n";
+            for (size_t i = 0; i < ds.attack_ts_series.size(); ++i) {
+                alert << "    " << ds.attack_ts_series[i]
+                      << (i + 1 < ds.attack_ts_series.size() ? "," : "") << "\n";
+            }
+            alert << "  ],\n  \"residual_series\": [\n";
+            for (size_t i = 0; i < ds.attack_residual_series.size(); ++i) {
+                alert << "    " << ds.attack_residual_series[i]
+                      << (i + 1 < ds.attack_residual_series.size() ? "," : "") << "\n";
+            }
+            alert << "  ],\n  \"dlc_series\": [\n";
+            for (size_t i = 0; i < ds.attack_dlc_series.size(); ++i) {
+                alert << "    " << ds.attack_dlc_series[i]
+                      << (i + 1 < ds.attack_dlc_series.size() ? "," : "") << "\n";
+            }
+            alert << "  ],\n  \"data_hex_series\": [\n";
+            for (size_t i = 0; i < ds.attack_data_hex_series.size(); ++i) {
+                alert << "    \"" << escape_json(ds.attack_data_hex_series[i]) << "\""
+                      << (i + 1 < ds.attack_data_hex_series.size() ? "," : "") << "\n";
+            }
+            alert << "  ],\n"
                   << "  \"pre_context\": [\n";
             for (size_t i = 0; i < ds.pre_context.size(); ++i) {
                 alert << "    \"" << escape_json(ds.pre_context[i]) << "\""
@@ -838,7 +1063,100 @@ void detect_on_stream(std::istream& in,
         msg_queue.push_back(raw);
         if (msg_queue.size() > static_cast<size_t>(CONTEXT_BEFORE + CONTEXT_AFTER + 1)) msg_queue.pop_front();
 
+        int can_dlc = -1;
+        std::string can_data_hex;
+        if (line.find("Timestamp:") == std::string::npos) {
+            parse_can_fields_from_csv_line(line, can_dlc, can_data_hex);
+        }
+
         if (attack) {
+            // 若攻击段过长，强制切段（NDJSON 模式也需要）
+            if (ds.consecutive_attacks >= MIN_CONSECUTIVE_ATTACKS &&
+                ds.attack_frame_count > 0 &&
+                (ds.attack_frame_count >= MAX_ATTACK_FRAMES_PER_SEGMENT ||
+                 (ds.attack_last_time > 0.0 && (ds.attack_last_time - ds.attack_start_time) >= MAX_ATTACK_DURATION_SEC))) {
+
+                double attack_mean = ds.attack_skew_sum / ds.attack_frame_count;
+                double attack_var = (ds.attack_skew_sq_sum / ds.attack_frame_count) - attack_mean * attack_mean;
+                double attack_std = std::sqrt(std::max(0.0, attack_var));
+                double end_ts = ds.attack_last_time;
+                double duration = end_ts - ds.attack_start_time;
+
+                std::vector<std::string> post_context;
+                int after = 0;
+                auto it_post = msg_queue.rbegin();
+                while (after < CONTEXT_AFTER && it_post != msg_queue.rend()) {
+                    post_context.push_back(*it_post);
+                    ++after;
+                    ++it_post;
+                }
+                std::reverse(post_context.begin(), post_context.end());
+
+                std::ostringstream alert;
+                alert << std::fixed << std::setprecision(6);
+                alert << "{\n  \"attack_id\": \"" << id << "\",\n"
+                      << "  \"start_time\": " << ds.attack_start_time << ",\n"
+                      << "  \"end_time\": " << end_ts << ",\n"
+                      << "  \"duration\": " << duration << ",\n"
+                      << "  \"frame_count\": " << ds.attack_frame_count << ",\n"
+                      << "  \"mean_skew\": " << attack_mean << ",\n"
+                      << "  \"stddev_skew\": " << attack_std << ",\n"
+                      << "  \"cycle\": " << ds.current_cycle << ",\n"
+                      << "  \"baseline_mean\": " << bl_it->second.mean_skew << ",\n"
+                      << "  \"baseline_stddev\": " << std::max(bl_it->second.stddev_skew, BASELINE_STDDEV_FLOOR) << ",\n"
+                      << "  \"thr_3sigma\": " << attack_threshold_3sigma(bl_it->second) << ",\n"
+                      << "  \"residual_min\": " << ds.attack_residual_min << ",\n"
+                      << "  \"residual_max\": " << ds.attack_residual_max << ",\n"
+                      << "  \"segment_end_reason\": \"cap\",\n"
+                      << "  \"ts_series\": [\n";
+                for (size_t i = 0; i < ds.attack_ts_series.size(); ++i) {
+                    alert << "    " << ds.attack_ts_series[i]
+                          << (i + 1 < ds.attack_ts_series.size() ? "," : "") << "\n";
+                }
+                alert << "  ],\n  \"residual_series\": [\n";
+                for (size_t i = 0; i < ds.attack_residual_series.size(); ++i) {
+                    alert << "    " << ds.attack_residual_series[i]
+                          << (i + 1 < ds.attack_residual_series.size() ? "," : "") << "\n";
+                }
+                alert << "  ],\n"
+                      << "  \"pre_context\": [\n";
+                for (size_t i = 0; i < ds.pre_context.size(); ++i) {
+                    alert << "    \"" << escape_json(ds.pre_context[i]) << "\""
+                          << (i + 1 < ds.pre_context.size() ? "," : "") << "\n";
+                }
+                alert << "  ],\n  \"attack_frames\": [\n";
+                for (size_t i = 0; i < ds.attack_context.size(); ++i) {
+                    alert << "    \"" << escape_json(ds.attack_context[i]) << "\""
+                          << (i + 1 < ds.attack_context.size() ? "," : "") << "\n";
+                }
+                alert << "  ],\n  \"post_context\": [\n";
+                for (size_t i = 0; i < post_context.size(); ++i) {
+                    alert << "    \"" << escape_json(post_context[i]) << "\""
+                          << (i + 1 < post_context.size() ? "," : "") << "\n";
+                }
+                alert << "  ]\n}\n";
+
+                if (ndjson_output) {
+                    write_attack_ndjson(alert.str());
+                } else {
+                    attack_packets.push_back(alert.str());
+                }
+                attack_alerts++;
+
+                ds.consecutive_attacks = 0;
+                ds.consecutive_non_attacks = 0;
+                ds.attack_end_time_candidate = 0.0;
+                ds.attack_last_time = 0.0;
+                ds.attack_frame_count = 0;
+                ds.attack_skew_sum = 0.0;
+                ds.attack_skew_sq_sum = 0.0;
+                ds.attack_context.clear();
+                ds.attack_ts_series.clear();
+                ds.attack_residual_series.clear();
+                ds.attack_residual_min = 0.0;
+                ds.attack_residual_max = 0.0;
+                ds.pre_context.clear();
+            }
             if (ds.consecutive_attacks == 0) {
                 // 攻击开始
                 ds.attack_start_time = ts;
@@ -848,6 +1166,12 @@ void detect_on_stream(std::istream& in,
                 ds.attack_frame_count = 1;
                 ds.attack_context.clear();
                 ds.attack_context.push_back(raw);
+                ds.attack_ts_series.clear();
+                ds.attack_residual_series.clear();
+                ds.attack_ts_series.push_back(ts);
+                ds.attack_residual_series.push_back(residual_now);
+                ds.attack_residual_min = residual_now;
+                ds.attack_residual_max = residual_now;
                 ds.consecutive_non_attacks = 0;
                 ds.attack_end_time_candidate = 0.0;
 
@@ -867,12 +1191,80 @@ void detect_on_stream(std::istream& in,
                 ds.attack_skew_sq_sum += residual_now * residual_now;
                 ds.attack_frame_count++;
                 ds.attack_context.push_back(raw);
+                ds.attack_ts_series.push_back(ts);
+                ds.attack_residual_series.push_back(residual_now);
+                ds.attack_dlc_series.push_back(can_dlc);
+                ds.attack_data_hex_series.push_back(can_data_hex);
+                ds.attack_residual_min = std::min(ds.attack_residual_min, residual_now);
+                ds.attack_residual_max = std::max(ds.attack_residual_max, residual_now);
             }
             // 攻击重新成立：取消退出确认计数
             ds.attack_last_time = ts;
             ds.consecutive_non_attacks = 0;
             ds.attack_end_time_candidate = 0.0;
             ds.consecutive_attacks++;
+
+            // NDJSON：达到最小连续攻击帧时立刻输出 pending 片段（用于 injecting 期间实时展示）
+            if (ndjson_output && ds.consecutive_attacks == MIN_CONSECUTIVE_ATTACKS) {
+                double attack_mean = ds.attack_skew_sum / ds.attack_frame_count;
+                double attack_var = (ds.attack_skew_sq_sum / ds.attack_frame_count) - attack_mean * attack_mean;
+                double attack_std = std::sqrt(std::max(0.0, attack_var));
+                double end_ts = ds.attack_last_time;
+                double duration = end_ts - ds.attack_start_time;
+
+                std::ostringstream alert;
+                alert << std::fixed << std::setprecision(6);
+                alert << "{\n  \"attack_id\": \"" << id << "\",\n"
+                      << "  \"event\": \"start\",\n"
+                      << "  \"start_time\": " << ds.attack_start_time << ",\n"
+                      << "  \"end_time\": " << end_ts << ",\n"
+                      << "  \"duration\": " << duration << ",\n"
+                      << "  \"frame_count\": " << ds.attack_frame_count << ",\n"
+                      << "  \"mean_skew\": " << attack_mean << ",\n"
+                      << "  \"stddev_skew\": " << attack_std << ",\n"
+                      << "  \"cycle\": " << ds.current_cycle << ",\n"
+                      << "  \"baseline_mean\": " << bl_it->second.mean_skew << ",\n"
+                      << "  \"baseline_stddev\": " << std::max(bl_it->second.stddev_skew, BASELINE_STDDEV_FLOOR) << ",\n"
+                      << "  \"thr_3sigma\": " << attack_threshold_3sigma(bl_it->second) << ",\n"
+                      << "  \"residual_min\": " << ds.attack_residual_min << ",\n"
+                      << "  \"residual_max\": " << ds.attack_residual_max << ",\n"
+                      << "  \"segment_end_reason\": \"start\",\n"
+                      << "  \"ts_series\": [\n";
+                for (size_t i = 0; i < ds.attack_ts_series.size(); ++i) {
+                    alert << "    " << ds.attack_ts_series[i]
+                          << (i + 1 < ds.attack_ts_series.size() ? "," : "") << "\n";
+                }
+                alert << "  ],\n  \"residual_series\": [\n";
+                for (size_t i = 0; i < ds.attack_residual_series.size(); ++i) {
+                    alert << "    " << ds.attack_residual_series[i]
+                          << (i + 1 < ds.attack_residual_series.size() ? "," : "") << "\n";
+                }
+                alert << "  ],\n  \"dlc_series\": [\n";
+                for (size_t i = 0; i < ds.attack_dlc_series.size(); ++i) {
+                    alert << "    " << ds.attack_dlc_series[i]
+                          << (i + 1 < ds.attack_dlc_series.size() ? "," : "") << "\n";
+                }
+                alert << "  ],\n  \"data_hex_series\": [\n";
+                for (size_t i = 0; i < ds.attack_data_hex_series.size(); ++i) {
+                    alert << "    \"" << escape_json(ds.attack_data_hex_series[i]) << "\""
+                          << (i + 1 < ds.attack_data_hex_series.size() ? "," : "") << "\n";
+                }
+                alert << "  ],\n  \"pre_context\": [\n";
+                for (size_t i = 0; i < ds.pre_context.size(); ++i) {
+                    alert << "    \"" << escape_json(ds.pre_context[i]) << "\""
+                          << (i + 1 < ds.pre_context.size() ? "," : "") << "\n";
+                }
+                alert << "  ],\n  \"attack_frames\": [\n";
+                for (size_t i = 0; i < ds.attack_context.size(); ++i) {
+                    alert << "    \"" << escape_json(ds.attack_context[i]) << "\""
+                          << (i + 1 < ds.attack_context.size() ? "," : "") << "\n";
+                }
+                alert << "  ],\n  \"post_context\": [\n";
+                alert << "  ]\n}\n";
+
+                write_attack_ndjson(alert.str());
+                attack_alerts++;
+            }
         } else {
             // 在攻击结束前：至少连续 N 帧非攻击才真正关闭该段
             if (ds.consecutive_attacks > 0) {
@@ -942,6 +1334,10 @@ void detect_on_stream(std::istream& in,
                     ds.attack_skew_sum = 0.0;
                     ds.attack_skew_sq_sum = 0.0;
                     ds.attack_context.clear();
+                    ds.attack_ts_series.clear();
+                    ds.attack_residual_series.clear();
+                    ds.attack_residual_min = 0.0;
+                    ds.attack_residual_max = 0.0;
                     ds.pre_context.clear();
                 }
             } else {

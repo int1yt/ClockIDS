@@ -11,8 +11,9 @@ import subprocess
 import tempfile
 import threading
 import time
+import traceback
 import uuid
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from django.conf import settings
 from django.http import JsonResponse
@@ -373,6 +374,9 @@ def start_monitor(request):
         num_ids = int(body.get("num_ids", 5))
         batch_ml_size = max(1, int(body.get("batch_ml_size", 12)))
         seed = body.get("seed", None)
+        ethernet_csv = body.get("ethernet_csv", None)
+        # “以太网攻击链”模式：多少比例的 CAN 攻击发生在以太网异常之后
+        after_abnormal_ratio = float(body.get("after_abnormal_ratio", 0.6))
 
         from .attack_generator import (
             load_baselines_csv,
@@ -381,9 +385,21 @@ def start_monitor(request):
             generate_mixed_attack_stream_csv,
             pick_multiple_baselines,
             generate_multi_id_mixed_stream,
+            generate_ethernet_chain_stream_csv,
+            generate_multi_id_ethernet_chain_stream,
+            ethernet_csv_start_ts_epoch,
         )
 
         baselines = load_baselines_csv(settings.CLOCKIDS_BASELINES_CSV_PATH)
+
+        # ---------- Timestamp alignment (Ethernet -> CAN) ----------
+        start_ts = 0.0
+        try:
+            csv_path = str(ethernet_csv).strip() if ethernet_csv else str(getattr(settings, "ETHERNET_DEFAULT_CSV_PATH", "")).strip()
+            if csv_path:
+                start_ts = float(ethernet_csv_start_ts_epoch(csv_path))
+        except Exception:
+            start_ts = 0.0
 
         ecu_ids_param = body.get("ecu_ids")
         if isinstance(ecu_ids_param, str) and ecu_ids_param.strip():
@@ -414,15 +430,35 @@ def start_monitor(request):
                     {"error": "multi_id 需要至少 2 条有效 baselines，请检查 clockids_baselines.csv"},
                     status=400,
                 )
-            stream_iter, chosen_per_id = generate_multi_id_mixed_stream(
-                rows,
-                attack_kinds=attack_kinds,
-                num_attacks=num_attacks,
-                pre_frames=pre_frames,
-                attack_frames=attack_frames,
-                post_frames=post_frames,
-                seed=seed,
-            )
+            if mode == "ethernet_chain":
+                csv_path = str(ethernet_csv).strip() if ethernet_csv else str(getattr(settings, "ETHERNET_DEFAULT_CSV_PATH", "")).strip()
+                if not csv_path:
+                    return JsonResponse({"error": "ethernet_chain 模式需要 ethernet_csv（或设置 ETHERNET_DEFAULT_CSV_PATH）"}, status=400)
+                stream_iter, chosen_per_id = generate_multi_id_ethernet_chain_stream(
+                    rows,
+                    ethernet_csv_path=csv_path,
+                    ecu_ids=[str(r["id"]) for r in rows],
+                    attack_kinds=attack_kinds,
+                    num_attacks=num_attacks,
+                    after_abnormal_ratio=after_abnormal_ratio,
+                    start_ts=start_ts,
+                    pre_frames=pre_frames,
+                    attack_frames=attack_frames,
+                    gap_frames=None,
+                    post_frames=post_frames,
+                    seed=seed,
+                )
+            else:
+                stream_iter, chosen_per_id = generate_multi_id_mixed_stream(
+                    rows,
+                    attack_kinds=attack_kinds,
+                    num_attacks=num_attacks,
+                    pre_frames=pre_frames,
+                    attack_frames=attack_frames,
+                    post_frames=post_frames,
+                    start_ts=start_ts,
+                    seed=seed,
+                )
             ecu_ids_list = [str(r["id"]) for r in rows]
             cycles_map = {str(r["id"]): float(r["cycle"]) for r in rows}
             ecu_id = ecu_ids_list[0]
@@ -442,7 +478,7 @@ def start_monitor(request):
                     ecu_id,
                     cycle,
                     kind,
-                    start_ts=0.0,
+                    start_ts=start_ts,
                     pre_frames=pre_frames,
                     attack_frames=attack_frames,
                     post_frames=post_frames,
@@ -455,15 +491,35 @@ def start_monitor(request):
                     cycle,
                     attack_kinds=attack_kinds,
                     num_attacks=num_attacks,
-                    start_ts=0.0,
+                    start_ts=start_ts,
                     pre_frames=pre_frames,
                     attack_frames=attack_frames,
                     post_frames=post_frames,
                     seed=seed,
                 )
                 chosen_attack_kinds = chosen_seq
+            elif mode == "ethernet_chain":
+                csv_path = str(ethernet_csv).strip() if ethernet_csv else str(getattr(settings, "ETHERNET_DEFAULT_CSV_PATH", "")).strip()
+                if not csv_path:
+                    return JsonResponse({"error": "ethernet_chain 模式需要 ethernet_csv（或设置 ETHERNET_DEFAULT_CSV_PATH）"}, status=400)
+                stream_iter, segs = generate_ethernet_chain_stream_csv(
+                    str(ecu_id),
+                    float(cycle),
+                    ethernet_csv_path=csv_path,
+                    attack_kinds=attack_kinds,
+                    num_attacks=num_attacks,
+                    after_abnormal_ratio=after_abnormal_ratio,
+                    start_ts=start_ts,
+                    pre_frames=pre_frames,
+                    attack_frames=attack_frames,
+                    gap_frames=None,
+                    post_frames=post_frames,
+                    seed=seed,
+                )
+                # 兼容 meta 结构：单 ID 也按“每 ID 一个对象”返回
+                chosen_attack_kinds = [str(s.get("kind")) for s in segs]
             else:
-                return JsonResponse({"error": "Invalid mode. Use mode='single' or 'mixed'."}, status=400)
+                return JsonResponse({"error": "Invalid mode. Use mode='single' or 'mixed' or 'ethernet_chain'."}, status=400)
             chosen_per_id = [{"id": str(ecu_id), "chosen_attack_kinds": chosen_attack_kinds}]
 
         session_id = uuid.uuid4().hex
@@ -553,16 +609,154 @@ def start_monitor(request):
                 )
 
                 # 避免 C++ 向 stderr 大量输出时管道塞满导致子进程阻塞（Windows 上常见）
+                stderr_tail: List[str] = []
+
                 def _drain_stderr() -> None:
                     try:
                         if proc.stderr:
-                            proc.stderr.read()
+                            for line in proc.stderr:
+                                stderr_tail.append(line)
+                                # 只保留最后 N 行，避免占用内存
+                                if len(stderr_tail) > 200:
+                                    del stderr_tail[:50]
                     except Exception:
                         pass
 
                 threading.Thread(target=_drain_stderr, daemon=True).start()
 
                 stats: Dict[str, int] = {"cpp_packets_seen": 0, "classified_packets": 0}
+
+                def _pkt_key(pkt: Dict[str, Any]) -> str:
+                    # 用 attack_id + start_time 作为更新 key，避免 pending/ML 重复展示
+                    aid = str(pkt.get("attack_id", "")).strip()
+                    st = float(pkt.get("start_time", 0.0))
+                    return f"{aid}:{st:.6f}"
+
+                def _upsert_session_alert(session_id: str, key: str, alert: Dict[str, Any]) -> None:
+                    with _monitor_sessions_lock:
+                        sess = _monitor_sessions.get(session_id)
+                        if not sess:
+                            return
+                        for i, old in enumerate(sess["alerts"]):
+                            if isinstance(old, dict) and str(old.get("_key", "")) == str(key):
+                                alert["_key"] = key
+                                sess["alerts"][i] = alert
+                                return
+                        alert["_key"] = key
+                        sess["alerts"].append(alert)
+
+                # ---------- Upload queue (JSON reports) ----------
+                upload_dir = getattr(settings, "UPLOAD_QUEUE_DIR", None)
+                if upload_dir:
+                    os.makedirs(str(upload_dir), exist_ok=True)
+
+                upload_context_max = int(body.get("upload_context_max", 40))
+                upload_write_full = bool(body.get("upload_write_full", False))
+
+                def _truncate_list(xs: Any, max_n: int) -> Tuple[Any, Optional[int]]:
+                    if not isinstance(xs, list):
+                        return xs, None
+                    if max_n <= 0:
+                        return [], len(xs)
+                    if len(xs) <= max_n:
+                        return xs, len(xs)
+                    head_n = max(1, max_n // 2)
+                    tail_n = max_n - head_n
+                    return xs[:head_n] + ["<...truncated...>"] + xs[-tail_n:], len(xs)
+
+                def _write_upload_json(result: Dict[str, Any]) -> None:
+                    if not upload_dir:
+                        return
+                    # result 可能来自两种来源：
+                    # 1) ML 预测结果（包含 attack_type/confidence/...，以及 detail=ClockIDS 原始告警）
+                    # 2) ClockIDS 原始告警 pkt（直接就是 start_time/end_time/上下文字段）
+                    pkt = {}
+                    if isinstance(result, dict):
+                        detail_candidate = result.get("detail", None)
+                        if isinstance(detail_candidate, dict):
+                            pkt = detail_candidate
+                        else:
+                            pkt = result
+                    else:
+                        return
+
+                    ts = float(pkt.get("start_time", time.time()))
+                    fname = f"{session_id}_{int(ts*1000)}_{uuid.uuid4().hex}.json"
+                    fpath = os.path.join(str(upload_dir), fname)
+
+                    # 为避免文件无限膨胀：对 context 做截断，但保留原长度统计
+                    detail_out = dict(pkt)
+                    pre_ctx, pre_len = _truncate_list(detail_out.get("pre_context"), upload_context_max)
+                    atk_ctx, atk_len = _truncate_list(detail_out.get("attack_frames"), upload_context_max)
+                    post_ctx, post_len = _truncate_list(detail_out.get("post_context"), upload_context_max)
+                    ts_series, ts_len = _truncate_list(detail_out.get("ts_series"), upload_context_max)
+                    res_series, res_len = _truncate_list(detail_out.get("residual_series"), upload_context_max)
+                    dlc_series, dlc_len = _truncate_list(detail_out.get("dlc_series"), upload_context_max)
+                    data_hex_series, data_hex_len = _truncate_list(detail_out.get("data_hex_series"), upload_context_max)
+                    if pre_len is not None:
+                        detail_out["pre_context"] = pre_ctx
+                        detail_out["pre_context_len"] = pre_len
+                    if atk_len is not None:
+                        detail_out["attack_frames"] = atk_ctx
+                        detail_out["attack_frames_len"] = atk_len
+                    if post_len is not None:
+                        detail_out["post_context"] = post_ctx
+                        detail_out["post_context_len"] = post_len
+                    if ts_len is not None:
+                        detail_out["ts_series"] = ts_series
+                        detail_out["ts_series_len"] = ts_len
+                    if res_len is not None:
+                        detail_out["residual_series"] = res_series
+                        detail_out["residual_series_len"] = res_len
+                    if dlc_len is not None:
+                        detail_out["dlc_series"] = dlc_series
+                        detail_out["dlc_series_len"] = dlc_len
+                    if data_hex_len is not None:
+                        detail_out["data_hex_series"] = data_hex_series
+                        detail_out["data_hex_series_len"] = data_hex_len
+
+                    meta = {
+                        "ethernet_csv": (str(ethernet_csv).strip() if ethernet_csv else str(getattr(settings, "ETHERNET_DEFAULT_CSV_PATH", "")).strip()),
+                        "start_ts_aligned": start_ts,
+                        "mode": mode,
+                        "multi_id": multi_id,
+                        "ecu_ids": ecu_ids_list,
+                        "cycles": cycles_map,
+                        "chosen_per_id": chosen_per_id,
+                        "batch_ml_size": batch_ml_size,
+                    }
+
+                    with open(fpath, "w", encoding="utf-8") as f:
+                        json.dump(
+                            {
+                                "ts": ts,
+                                "source": "can",
+                                "session_id": session_id,
+                                "meta": meta,
+                                # 这里写入 ClockIDS 检测到的“异常明细”，不包含 ML 结果
+                                "result": detail_out,
+                            },
+                            f,
+                            indent=2,
+                            ensure_ascii=False,
+                        )
+
+                    # 可选：同时落一份“完整上下文”的原始结果（更大）
+                    if upload_write_full:
+                        full_path = os.path.join(str(upload_dir), fname.replace(".json", ".full.json"))
+                        with open(full_path, "w", encoding="utf-8") as f:
+                            json.dump(
+                                {
+                                    "ts": ts,
+                                    "source": "can",
+                                    "session_id": session_id,
+                                    "meta": meta,
+                                    "result": dict(pkt),
+                                },
+                                f,
+                                indent=2,
+                                ensure_ascii=False,
+                            )
 
                 def reader():
                     assert proc.stdout is not None
@@ -575,7 +769,35 @@ def start_monitor(request):
                             pkt = json.loads(line)
                         except Exception:
                             continue
+                        # 给 ML 附加每个 attack_id 对应的 cycle，便于做归一化特征（跨 ID 更稳）
+                        try:
+                            sid = str(pkt.get("attack_id", "")).strip()
+                            cyc = cycles_map.get(sid)
+                            if cyc is not None:
+                                pkt["cycle"] = float(cyc)
+                        except Exception:
+                            pass
                         buf.append(pkt)
+                        # ClockIDS 一检测到异常就立刻落盘：仅写 ClockIDS 异常明细（无 ML）
+                        try:
+                            _write_upload_json(pkt)
+                        except Exception:
+                            pass
+                        # ClockIDS 异常一出现就立刻推送到前端（pending 状态）
+                        try:
+                            key = _pkt_key(pkt)
+                            pending_alert = {
+                                "attack_type": "unknown",
+                                "confidence": 0.0,
+                                "probabilities": {},
+                                "features": {},
+                                "detail": pkt,
+                                "_ml_pending": True,
+                                "_key": key,
+                            }
+                            _append_session_alert(session_id, pending_alert)
+                        except Exception:
+                            pass
                         stats["cpp_packets_seen"] += 1
                         if stats["cpp_packets_seen"] % 50 == 0:
                             _set_session_progress(
@@ -608,7 +830,14 @@ def start_monitor(request):
                             buf.clear()
                             stats["classified_packets"] += len(preds)
                             for p in preds:
-                                _append_session_alert(session_id, p)
+                                try:
+                                    det = p.get("detail", {}) if isinstance(p, dict) else {}
+                                    key = _pkt_key(det if isinstance(det, dict) else {})
+                                    p["_ml_pending"] = False
+                                    p["_key"] = key
+                                    _append_session_alert(session_id, p)
+                                except Exception:
+                                    _append_session_alert(session_id, p)
                             _set_session_progress(
                                 session_id,
                                 {
@@ -626,7 +855,14 @@ def start_monitor(request):
                         stats["classified_packets"] += len(preds)
                         buf.clear()
                         for p in preds:
-                            _append_session_alert(session_id, p)
+                            try:
+                                det = p.get("detail", {}) if isinstance(p, dict) else {}
+                                key = _pkt_key(det if isinstance(det, dict) else {})
+                                p["_ml_pending"] = False
+                                p["_key"] = key
+                                _append_session_alert(session_id, p)
+                            except Exception:
+                                _append_session_alert(session_id, p)
 
                         _set_session_progress(
                             session_id,
@@ -669,7 +905,11 @@ def start_monitor(request):
                 rc = proc.wait(timeout=60)
                 err_msg = None
                 if rc != 0:
-                    err_msg = f"ClockIDS.exe 退出码 {rc}"
+                    tail = "".join(stderr_tail[-50:]).strip()
+                    if tail:
+                        err_msg = f"ClockIDS.exe 退出码 {rc}\n[c++ stderr tail]\n{tail}"
+                    else:
+                        err_msg = f"ClockIDS.exe 退出码 {rc}"
                 _set_session_progress(
                     session_id,
                     {
@@ -684,19 +924,28 @@ def start_monitor(request):
                 )
                 _set_session_done(session_id, done=True, error=err_msg)
             except Exception as e:
+                tb = traceback.format_exc()
+                tail = ""
+                try:
+                    tail = "".join(stderr_tail[-50:]).strip()
+                except Exception:
+                    tail = ""
                 _set_session_progress(
                     session_id,
                     {
                         "stage": "error",
                         "message": "检测流程异常退出",
                         "stats": {
-                            "cpp_packets_seen": 0,
-                            "classified_packets": 0,
+                            "cpp_packets_seen": stats.get("cpp_packets_seen", 0),
+                            "classified_packets": stats.get("classified_packets", 0),
                             "buf_len": 0,
                         },
                     },
                 )
-                _set_session_done(session_id, done=True, error=str(e))
+                err = f"{type(e).__name__}: {e}\n{tb}"
+                if tail:
+                    err += f"\n[c++ stderr tail]\n{tail}"
+                _set_session_done(session_id, done=True, error=err)
 
         threading.Thread(target=worker, daemon=True).start()
         return JsonResponse({"session_id": session_id}, safe=False)
