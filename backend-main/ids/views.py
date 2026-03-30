@@ -226,7 +226,6 @@ def simulate_attack_and_predict(request):
             mode = "single" if attack_kind else "mixed"
 
         classifier = __build_classifier_service()
-        classifier.ensure_trained()
 
         # 需要 baselines.csv，否则 detect 无法运行
         # ensure_trained 内部已保证 baselines 存在，这里再读一次拿到 cycle/id
@@ -251,6 +250,12 @@ def simulate_attack_and_predict(request):
         post_frames = int(body.get("post_frames", 240))
         num_attacks = int(body.get("num_attacks", 4))
         seed = body.get("seed", None)
+
+        classifier.ensure_trained(
+            pre_frames=pre_frames,
+            attack_frames=attack_frames,
+            post_frames=post_frames,
+        )
 
         results_true_sequence = None
         if mode == "single":
@@ -509,7 +514,11 @@ def start_monitor(request):
                         },
                     },
                 )
-                classifier.ensure_trained()
+                classifier.ensure_trained(
+                    pre_frames=pre_frames,
+                    attack_frames=attack_frames,
+                    post_frames=post_frames,
+                )
                 _set_session_progress(
                     session_id,
                     {

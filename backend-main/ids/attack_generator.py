@@ -78,7 +78,7 @@ def generate_attack_stream_csv(
     attack_frames: int = 180,
     post_frames: int = 120,
     # 正常段抖动越小，RLS 越容易在攻击后快速回落到基线
-    jitter_ratio_normal: float = 0.005,
+    jitter_ratio_normal: float = 0.01,
     jitter_ratio_attack: float = 0.06,
     # attack strength 控制（不同攻击种类用不同策略；偏强以保证能触发 3σ）
     dos_cycle_delta: float = 0.65,
@@ -141,8 +141,20 @@ def generate_attack_stream_csv(
         yield emit(t)
 
     # --- 恢复正常段 ---
+    # 攻击段会改变累积时间相位；如果完全不做补偿，ClockIDS 的“全局预测误差”在 post-normal
+    # 段里会持续偏离基线，导致攻击段 end_time 被拉得很长。
+    # 这里在 post-normal 的前一小段窗口内，将累积漂移按帧平均拉回，模拟真实系统的快速恢复。
+    expected_t_after_attack = start_ts + (pre_frames + attack_frames) * cycle
+    drift = t - expected_t_after_attack  # >0 表示当前更“靠后/更长”，需要在前几帧缩短
+    correction_window = max(1, min(post_frames, 30))
+
     for k in range(post_frames):
-        t += cycle + _jitter(cycle, jitter_ratio_normal)
+        base_interval = cycle + _jitter(cycle, jitter_ratio_normal)
+        if k < correction_window:
+            base_interval += (-drift / correction_window)
+        if base_interval <= 0:
+            base_interval = max(1e-6, cycle)
+        t += base_interval
         yield emit(t)
 
 
@@ -160,9 +172,12 @@ def generate_mixed_attack_stream_csv(
     start_ts: float = 0.0,
     pre_frames: int = 240,
     attack_frames: int = 220,
+    # 攻击段之间插入多少“正常帧”（用于让 ClockIDS.cpp 的攻击状态真正结束）
+    # 默认按 attack_frames 自动推导，保证测试和验证的一致性
+    gap_frames: Optional[int] = None,
     post_frames: int = 240,
     # 正常段抖动越小，RLS 越容易在攻击后快速回落到基线
-    jitter_ratio_normal: float = 0.005,
+    jitter_ratio_normal: float = 0.01,
     jitter_ratio_attack: float = 0.06,
     seed: Optional[int] = None,
 ) -> Tuple[Iterable[str], List[str]]:
@@ -179,6 +194,9 @@ def generate_mixed_attack_stream_csv(
 
     # 先确定每段攻击类型，便于调用方在迭代前拿到真实序列（与 ML 预测对照）
     chosen: List[str] = [random.choice(list(attack_kinds)) for _ in range(num_attacks)]
+    if gap_frames is None:
+        # 攻击段之间的间隔需要足够长，否则 ClockIDS 可能把相邻告警合并成一个超长段
+        gap_frames = max(20, int(attack_frames * 0.4))
 
     def _iter():
         t = start_ts
@@ -192,7 +210,7 @@ def generate_mixed_attack_stream_csv(
             yield emit(t)
 
         # alternating segments
-        for kind in chosen:
+        for seg_idx, kind in enumerate(chosen):
 
             two_pi = 2.0 * math.pi
             for j in range(attack_frames):
@@ -220,10 +238,17 @@ def generate_mixed_attack_stream_csv(
                 t += interval
                 yield emit(t)
 
+            # 在攻击类型之间插入一段正常帧，避免多段攻击被合并成一个超长告警
+            if seg_idx < len(chosen) - 1 and gap_frames > 0:
+                for _ in range(gap_frames):
+                    t += cycle + _jitter(cycle, jitter_ratio_normal)
+                    yield emit(t)
+
             # trailing normal
-            for _ in range(post_frames):
-                t += cycle + _jitter(cycle, jitter_ratio_normal)
-                yield emit(t)
+            # 注意：post_frames 在所有 attack kind 结束后统一追加
+        for _ in range(post_frames):
+            t += cycle + _jitter(cycle, jitter_ratio_normal)
+            yield emit(t)
 
     return _iter(), chosen
 

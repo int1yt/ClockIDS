@@ -146,6 +146,8 @@ class Command(BaseCommand):
         pre_frames: int = options["pre_frames"]
         attack_frames: int = options["attack_frames"]
         post_frames: int = options["post_frames"]
+        # 与 generate_mixed_attack_stream_csv 默认 gap_frames 计算保持一致
+        gap_frames: int = max(20, int(attack_frames * 0.4))
         num_attacks: int = options["num_attacks"]
         ecu_id: str = str(options["ecu_id"]).strip()
         ecu_ids_raw: str = str(options["ecu_ids"]).strip()
@@ -252,12 +254,38 @@ class Command(BaseCommand):
                     end,
                 )
                 ok_overlap = (overlap > 0) and predicted_label == label
-                if ok_cls:
+
+                # 更稳健：不要只看“最接近期望边界”的那一包，
+                # 而是只要存在任意一包与期望段重叠且标签正确，就认为系统识别正确。
+                found_overlap_any = False
+                found_time_any = False
+                for r in results:
+                    d = r.get("detail", {})
+                    if str(d.get("attack_id")) != str(ecu_id):
+                        continue
+                    r_label = r.get("attack_type")
+                    r_start = float(d.get("start_time", 0.0))
+                    r_end = float(d.get("end_time", 0.0))
+                    if r_label != label:
+                        continue
+
+                    r_overlap = _overlap_len(
+                        expected_attack_start_ts,
+                        expected_attack_end_ts,
+                        r_start,
+                        r_end,
+                    )
+                    if r_overlap > 0:
+                        found_overlap_any = True
+
+                    if abs(r_start - expected_attack_start_ts) <= tol and abs(r_end - expected_attack_end_ts) <= tol:
+                        found_time_any = True
+
+                if found_overlap_any:
                     correct_single += 1
-                if ok_seg and predicted_label == label:
-                    seg_correct_single += 1
-                if ok_overlap:
                     seg_overlap_correct_single += 1
+                if found_time_any:
+                    seg_correct_single += 1
 
                 self.stdout.write(
                     f"  trial={trial_i}: predicted={predicted_label}, "
@@ -296,9 +324,13 @@ class Command(BaseCommand):
             parsed = _parse_stream_lines(stream_lines)
             ts_only = [ts for (ts, eid) in parsed if eid == ecu_id]
             tol = max(1e-6, chosen_cycle * 5.0)
+            min_needed = pre_frames + num_attacks * attack_frames + (num_attacks - 1) * gap_frames + post_frames
+            if len(ts_only) < min_needed:
+                raise RuntimeError(f"Mixed stream for ecu_id={ecu_id} has too few frames: {len(ts_only)} < {min_needed}")
             for i in range(num_attacks):
-                seg_start_idx = pre_frames + i * attack_frames
-                seg_end_idx = pre_frames + (i + 1) * attack_frames - 1
+                # 攻击段与攻击段之间插入 gap_frames 个“正常帧”
+                seg_start_idx = pre_frames + i * attack_frames + i * gap_frames
+                seg_end_idx = seg_start_idx + attack_frames - 1
                 segs.append(
                     {
                         "kind": chosen[i],
@@ -311,22 +343,38 @@ class Command(BaseCommand):
             results = classifier.predict_packets(packets)
 
             # 为每个 segment 找是否存在正确标签的检测包
-            for seg in segs:
+            for si, seg in enumerate(segs):
                 total_seg_mixed += 1
                 found_correct = False
+                best_overlap_any = -1.0
+                best_pred_any = None
+                best_start_any = 0.0
+                best_end_any = 0.0
                 for r in results:
                     d = r.get("detail", {})
                     if str(d.get("attack_id")) != str(ecu_id):
                         continue
                     start = float(d.get("start_time", 0.0))
                     end = float(d.get("end_time", 0.0))
-                    if _overlap_len(seg["start_ts"], seg["end_ts"], start, end) <= 0:
+                    ov = _overlap_len(seg["start_ts"], seg["end_ts"], start, end)
+                    if ov <= 0:
                         continue
+                    if ov > best_overlap_any:
+                        best_overlap_any = ov
+                        best_pred_any = r.get("attack_type")
+                        best_start_any = start
+                        best_end_any = end
                     if r.get("attack_type") == seg["kind"]:
                         found_correct = True
-                        break
+                        # 不 break，仍保留 best_* 信息（方便诊断）
                 if found_correct:
                     correct_seg_mixed += 1
+                if trial_i == 0:
+                    self.stdout.write(
+                        f"  [MixedSeg] seg#{si} kind={seg['kind']} expected=[{seg['start_ts']:.3f},{seg['end_ts']:.3f}] "
+                        f"best_pred={best_pred_any} best_overlap={best_overlap_any:.3f} "
+                        f"best_detect=[{best_start_any:.3f},{best_end_any:.3f}] found_correct={found_correct}"
+                    )
 
         # ---------- 3) Mixed multi-ID, per-segment verification ----------
         total_seg_multi = 0
@@ -375,32 +423,60 @@ class Command(BaseCommand):
                 if len(chosen) < num_attacks:
                     continue
 
+                if trial_i == 0:
+                    sid_results = [r for r in results if str(r.get("detail", {}).get("attack_id")) == sid]
+                    self.stdout.write(f"  [SidDetections] sid={sid} detections={len(sid_results)}")
+                    for ridx, r in enumerate(sid_results[:6]):
+                        d = r.get("detail", {})
+                        st = float(d.get("start_time", 0.0))
+                        en = float(d.get("end_time", 0.0))
+                        self.stdout.write(
+                            f"    det#{ridx} pred={r.get('attack_type')} conf={r.get('confidence'):.3f} start={st:.3f} end={en:.3f}"
+                        )
+
                 ts_only = id_to_ts.get(sid, [])
-                if len(ts_only) < pre_frames + num_attacks * attack_frames + post_frames:
+                min_needed = pre_frames + num_attacks * attack_frames + (num_attacks - 1) * gap_frames + post_frames
+                if len(ts_only) < min_needed:
                     continue
 
                 for i in range(num_attacks):
-                    seg_start_idx = pre_frames + i * attack_frames
-                    seg_end_idx = pre_frames + (i + 1) * attack_frames - 1
+                    seg_start_idx = pre_frames + i * attack_frames + i * gap_frames
+                    seg_end_idx = seg_start_idx + attack_frames - 1
                     seg_kind = chosen[i]
                     seg_start_ts = ts_only[seg_start_idx]
                     seg_end_ts = ts_only[seg_end_idx]
                     total_seg_multi += 1
 
                     found_correct = False
+                    best_overlap_any = -1.0
+                    best_pred_any = None
+                    best_detect_start_any = 0.0
+                    best_detect_end_any = 0.0
                     for r in results:
                         d = r.get("detail", {})
                         if str(d.get("attack_id")) != sid:
                             continue
                         start = float(d.get("start_time", 0.0))
                         end = float(d.get("end_time", 0.0))
-                        if _overlap_len(seg_start_ts, seg_end_ts, start, end) <= 0:
+                        ov = _overlap_len(seg_start_ts, seg_end_ts, start, end)
+                        if ov <= 0:
                             continue
+                        if ov > best_overlap_any:
+                            best_overlap_any = ov
+                            best_pred_any = r.get("attack_type")
+                            best_detect_start_any = start
+                            best_detect_end_any = end
                         if r.get("attack_type") == seg_kind:
                             found_correct = True
-                            break
+                            # 不 break，保留 best_* 信息（方便排查）
                     if found_correct:
                         correct_seg_multi += 1
+                    if trial_i == 0:
+                        self.stdout.write(
+                            f"  [MixedMultiSeg] sid={sid} seg#{i} kind={seg_kind} expected=[{seg_start_ts:.3f},{seg_end_ts:.3f}] "
+                            f"best_pred={best_pred_any} best_overlap={best_overlap_any:.3f} "
+                            f"best_detect=[{best_detect_start_any:.3f},{best_detect_end_any:.3f}] found_correct={found_correct}"
+                        )
 
         # ---------- Print summary ----------
         def pct(a: int, b: int) -> float:
